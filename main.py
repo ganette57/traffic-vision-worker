@@ -23,3 +23,11 @@ def start() -> dict[str, str]:
 @app.post("/stop")
 def stop() -> dict[str, str]:
     return {"status": "stopped"}
+
+@app.post("/rounds/start")
+def start_round():
+    return {"status": "started"}
+
+@app.post("/rounds/stop")
+def stop_round():
+    return {"status": "stopped"}
