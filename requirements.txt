@@ -1,2 +1,5 @@
 fastapi
 uvicorn
+opencv-python
+ultralytics
+numpy
