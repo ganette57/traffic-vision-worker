@@ -179,10 +179,20 @@ def round_status(round_id: str | None = Query(default=None, alias="roundId")) ->
     }
 
 
+@app.get("/rounds/{round_id}/status")
+def round_status_by_path(round_id: str):
+    return round_status(round_id=round_id)
+
+
 @app.get("/frame.jpg")
 def frame(round_id: str | None = Query(default=None, alias="roundId")) -> Response:
     data = ROUND_MANAGER.get_frame(round_id)
     return Response(content=data, media_type="image/jpeg")
+
+
+@app.get("/rounds/{round_id}/frame.jpg")
+def frame_by_path(round_id: str):
+    return frame(round_id=round_id)
 
 
 # Legacy aliases kept for compatibility.
