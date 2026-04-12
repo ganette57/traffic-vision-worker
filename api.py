@@ -85,16 +85,28 @@ def _extract_ends_at(payload: dict[str, Any]) -> datetime | None:
     return ROUND_MANAGER.ensure_round_ends_at(None)
 
 
-def _status_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _status_payload(snapshot: dict[str, Any], *, include_runtime_status: bool = True) -> dict[str, Any]:
+    running = bool(snapshot.get("running"))
+    current_count = int(snapshot.get("currentCount") or 0)
+    camera_available = bool(snapshot.get("cameraAvailable"))
+    updated_at = snapshot.get("updatedAt")
+    payload: dict[str, Any] = {
         "roundId": snapshot.get("roundId"),
-        "running": bool(snapshot.get("running")),
-        "currentCount": int(snapshot.get("currentCount") or 0),
+        "running": running,
+        "currentCount": current_count,
+        "count": current_count,
         "startedAt": snapshot.get("startedAt"),
         "endsAt": snapshot.get("endsAt"),
-        "cameraAvailable": bool(snapshot.get("cameraAvailable")),
+        "cameraAvailable": camera_available,
+        "sourceOpened": camera_available,
+        "lastFrameAt": updated_at if camera_available else None,
+        "detectionsLastFrame": current_count,
         "lastError": snapshot.get("lastError"),
+        "updatedAt": updated_at,
     }
+    if include_runtime_status:
+        payload["status"] = "running" if running else "stopped"
+    return payload
 
 
 @app.get("/health")
@@ -118,7 +130,7 @@ def start_round(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[st
         metadata=payload,
     )
     LOGGER.info("API round start roundId=%s", round_id)
-    return {"status": "started", **_status_payload(snapshot)}
+    return {**_status_payload(snapshot, include_runtime_status=False), "status": "started"}
 
 
 @app.post("/rounds/stop")
@@ -136,10 +148,15 @@ def stop_round(
             "roundId": None,
             "running": False,
             "currentCount": 0,
+            "count": 0,
             "startedAt": None,
             "endsAt": None,
             "cameraAvailable": False,
+            "sourceOpened": False,
+            "lastFrameAt": None,
+            "detectionsLastFrame": 0,
             "lastError": "round not found",
+            "updatedAt": None,
         }
     snapshot = ROUND_MANAGER.stop_round(round_id)
     if snapshot is None:
@@ -148,13 +165,18 @@ def stop_round(
             "roundId": round_id,
             "running": False,
             "currentCount": 0,
+            "count": 0,
             "startedAt": None,
             "endsAt": None,
             "cameraAvailable": False,
+            "sourceOpened": False,
+            "lastFrameAt": None,
+            "detectionsLastFrame": 0,
             "lastError": "round not found",
+            "updatedAt": None,
         }
     LOGGER.info("API round stop roundId=%s", round_id)
-    return {"status": "stopped", **_status_payload(snapshot)}
+    return {**_status_payload(snapshot, include_runtime_status=False), "status": "stopped"}
 
 
 @app.get("/rounds/status")
@@ -165,11 +187,17 @@ def round_status(round_id: str | None = Query(default=None, alias="roundId")) ->
             return {
                 "roundId": round_id,
                 "running": False,
+                "status": "stopped",
                 "currentCount": 0,
+                "count": 0,
                 "startedAt": None,
                 "endsAt": None,
                 "cameraAvailable": False,
+                "sourceOpened": False,
+                "lastFrameAt": None,
+                "detectionsLastFrame": 0,
                 "lastError": "round not found",
+                "updatedAt": None,
             }
         return _status_payload(snapshot)
     rounds = ROUND_MANAGER.get_all_rounds()
@@ -187,7 +215,7 @@ def round_status_by_path(round_id: str):
 @app.get("/frame.jpg")
 def frame(round_id: str | None = Query(default=None, alias="roundId")) -> Response:
     data = ROUND_MANAGER.get_frame(round_id)
-    return Response(content=data, media_type="image/jpeg")
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/rounds/{round_id}/frame.jpg")
