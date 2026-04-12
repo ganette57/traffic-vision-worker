@@ -13,3 +13,13 @@ def health() -> dict[str, str]:
 @app.post("/count")
 def count() -> dict[str, int]:
     return {"count": randint(5, 50)}
+
+
+@app.post("/start")
+def start() -> dict[str, str]:
+    return {"status": "started"}
+
+
+@app.post("/stop")
+def stop() -> dict[str, str]:
+    return {"status": "stopped"}
