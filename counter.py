@@ -440,14 +440,26 @@ class TrafficRoundManager:
         return runtime.snapshot()
 
     def get_debug_frame_jpeg(self, round_id: str) -> Optional[bytes]:
+        lookup_key = str(round_id).strip()
         with self._lock:
-            runtime = self._rounds.get(round_id)
+            runtime = self._rounds.get(lookup_key)
         if not runtime:
+            print(
+                "[traffic-vision-worker] debug frame lookup miss",
+                {"roundId": lookup_key, "foundRound": False, "hasBytes": False},
+            )
             return None
         with runtime.lock:
-            if runtime.last_debug_frame_jpeg is None:
+            frame_bytes = runtime.last_debug_frame_jpeg
+            has_bytes = frame_bytes is not None
+            size = len(frame_bytes) if frame_bytes is not None else 0
+            print(
+                "[traffic-vision-worker] debug frame lookup",
+                {"roundId": lookup_key, "foundRound": True, "hasBytes": has_bytes, "bytes": size},
+            )
+            if frame_bytes is None:
                 return None
-            return bytes(runtime.last_debug_frame_jpeg)
+            return bytes(frame_bytes)
 
     def stop_round(self, round_id: str, reason: str = "manual_stop") -> Optional[Dict[str, object]]:
         with self._lock:
@@ -780,6 +792,13 @@ class TrafficRoundManager:
 
         with runtime.lock:
             runtime.last_debug_frame_jpeg = encoded.tobytes()
+            print(
+                "[traffic-vision-worker] debug frame stored",
+                {
+                    "roundId": runtime.spec.round_id,
+                    "bytes": len(runtime.last_debug_frame_jpeg),
+                },
+            )
 
     def _run_round(self, runtime: RoundRuntime) -> None:
         model = self._get_model()
@@ -1105,6 +1124,7 @@ class TrafficRoundManager:
                             "error": str(track_error),
                         },
                     )
+                    self._update_debug_frame(runtime, frame, [], line_x1, line_y1, line_x2, line_y2)
                     time.sleep(0.01)
                     continue
 

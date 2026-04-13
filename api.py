@@ -121,12 +121,17 @@ def round_status(round_id: str) -> Dict[str, object]:
 @app.get("/rounds/{round_id}/frame.jpg")
 def round_frame(round_id: str) -> Response:
     normalized_round_id = round_id.strip()
-    status = ROUND_MANAGER.get_status(normalized_round_id)
-    if not status:
-        raise HTTPException(status_code=404, detail="Round not found.")
+    print(
+        "[traffic-vision-worker] api frame lookup",
+        {"roundId": normalized_round_id},
+    )
 
     frame_jpeg = ROUND_MANAGER.get_debug_frame_jpeg(normalized_round_id)
     if not frame_jpeg:
+        print(
+            "[traffic-vision-worker] api frame fallback placeholder",
+            {"roundId": normalized_round_id},
+        )
         frame_jpeg = _build_placeholder_jpeg(normalized_round_id)
     return Response(
         content=frame_jpeg,
