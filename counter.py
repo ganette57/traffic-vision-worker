@@ -985,6 +985,22 @@ class TrafficRoundManager:
                 frame_idx += 1
                 with runtime.lock:
                     runtime.last_frame_at = time.time()
+                    has_debug_frame = runtime.last_debug_frame_jpeg is not None
+
+                if not has_debug_frame:
+                    raw_ok, raw_encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if raw_ok:
+                        raw_bytes = raw_encoded.tobytes()
+                        with runtime.lock:
+                            if runtime.last_debug_frame_jpeg is None:
+                                runtime.last_debug_frame_jpeg = raw_bytes
+                                print(
+                                    "[traffic-vision-worker] raw frame stored",
+                                    {
+                                        "roundId": runtime.spec.round_id,
+                                        "bytes": len(raw_bytes),
+                                    },
+                                )
 
                 frame_height, frame_width = frame.shape[:2]
                 if frame_width > 0 and frame_height > 0:
