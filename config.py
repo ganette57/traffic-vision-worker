@@ -13,6 +13,7 @@ class WorkerSettings:
     debug_video_file: str = os.getenv("TRAFFIC_VISION_DEBUG_VIDEO_FILE", "/tmp/traffic_sample.mp4")
     debug_use_local_file: bool = os.getenv("TRAFFIC_VISION_DEBUG_USE_LOCAL_FILE", "0") == "1"
     allow_concurrent_rounds: bool = os.getenv("TRAFFIC_ALLOW_CONCURRENT_ROUNDS", "0") == "1"
+    use_tracking: bool = os.getenv("TRAFFIC_USE_TRACKING", "0") == "1"
     process_fps: float = max(0.1, float(os.getenv("TRAFFIC_PROCESS_FPS", "2")))
     debug_frame_fps: float = max(0.1, float(os.getenv("TRAFFIC_DEBUG_FRAME_FPS", "2")))
     max_process_width: int = max(64, int(os.getenv("TRAFFIC_MAX_PROCESS_WIDTH", "960")))

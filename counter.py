@@ -383,8 +383,8 @@ class TrafficRoundManager:
         self._model_lock = threading.Lock()
         self._model: Optional[YOLO] = None
         print(
-            "[traffic-vision-worker] startup settings",
-            {"modelName": SETTINGS.model_name},
+            "[traffic-vision-worker] inference mode",
+            {"useTracking": SETTINGS.use_tracking, "modelName": SETTINGS.model_name},
         )
 
     def _get_model(self) -> YOLO:
@@ -522,6 +522,16 @@ class TrafficRoundManager:
     def _get_track_point(self, bbox: Tuple[float, float, float, float]) -> Tuple[float, float]:
         x_min, y_min, x_max, y_max = bbox
         return (float(x_min) + float(x_max)) / 2.0, (float(y_min) + float(y_max)) / 2.0
+
+    def _synthetic_track_id(self, class_id: int, bbox: Tuple[float, float, float, float]) -> int:
+        x_min, y_min, x_max, y_max = bbox
+        center_x = (float(x_min) + float(x_max)) / 2.0
+        center_y = (float(y_min) + float(y_max)) / 2.0
+        area = max(1.0, (float(x_max) - float(x_min)) * (float(y_max) - float(y_min)))
+        bucket_x = int(center_x // 64.0)
+        bucket_y = int(center_y // 64.0)
+        bucket_s = int((area ** 0.5) // 24.0)
+        return (abs(hash((int(class_id), bucket_x, bucket_y, bucket_s))) % 2_000_000_000) + 1
 
     def _is_track_in_roi(
         self,
@@ -998,6 +1008,8 @@ class TrafficRoundManager:
         roi_y2: Optional[int] = None
         line_metrics_logged = False
         tracker_cfg = "bytetrack.yaml"
+        use_tracking = bool(SETTINGS.use_tracking)
+        inference_slow_sec = max(0.1, float(os.getenv("TRAFFIC_INFERENCE_SLOW_SEC", "2.5")))
         if str(runtime.spec.tracker or "").strip().lower() in ("bytetrack", "bytetrack.yaml"):
             tracker_cfg = "bytetrack.yaml"
 
@@ -1218,19 +1230,31 @@ class TrafficRoundManager:
 
                 if should_log_tick:
                     print(
-                        "[traffic-vision-worker] model.track start",
+                        "[traffic-vision-worker] model.track start"
+                        if use_tracking
+                        else "[traffic-vision-worker] model.predict start",
                         {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
+                inference_started_at = time.time()
                 try:
-                    results = model.track(
-                        processed_frame,
-                        persist=True,
-                        tracker=tracker_cfg,
-                        classes=runtime.spec.class_ids,
-                        conf=SETTINGS.conf_threshold,
-                        iou=SETTINGS.iou_threshold,
-                        verbose=False,
-                    )
+                    if use_tracking:
+                        results = model.track(
+                            processed_frame,
+                            persist=True,
+                            tracker=tracker_cfg,
+                            classes=runtime.spec.class_ids,
+                            conf=SETTINGS.conf_threshold,
+                            iou=SETTINGS.iou_threshold,
+                            verbose=False,
+                        )
+                    else:
+                        results = model.predict(
+                            processed_frame,
+                            classes=runtime.spec.class_ids,
+                            conf=SETTINGS.conf_threshold,
+                            iou=SETTINGS.iou_threshold,
+                            verbose=False,
+                        )
                 except Exception as track_error:
                     print(
                         "[traffic-vision-worker] frame processing error",
@@ -1252,11 +1276,34 @@ class TrafficRoundManager:
                     time.sleep(0.01)
                     continue
 
+                inference_elapsed = time.time() - inference_started_at
+                print(
+                    "[traffic-vision-worker] model inference done",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "frame": processed_frame_idx,
+                        "useTracking": use_tracking,
+                        "elapsedMs": int(inference_elapsed * 1000.0),
+                    },
+                )
                 if should_log_tick:
                     print(
-                        "[traffic-vision-worker] model.track done",
+                        "[traffic-vision-worker] model.track done"
+                        if use_tracking
+                        else "[traffic-vision-worker] model.predict done",
                         {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
+                if inference_elapsed > inference_slow_sec:
+                    print(
+                        "[traffic-vision-worker] inference too slow, skipping post-processing",
+                        {
+                            "roundId": runtime.spec.round_id,
+                            "frame": processed_frame_idx,
+                            "elapsedMs": int(inference_elapsed * 1000.0),
+                            "thresholdMs": int(inference_slow_sec * 1000.0),
+                        },
+                    )
+                    continue
 
                 if not results:
                     with runtime.lock:
@@ -1287,7 +1334,7 @@ class TrafficRoundManager:
                         line_y2,
                     )
                     continue
-                if boxes.id is None or boxes.cls is None or boxes.xyxy is None:
+                if boxes.cls is None or boxes.xyxy is None:
                     with runtime.lock:
                         runtime.detections_last_frame = 0
                     self._update_debug_frame(
@@ -1301,9 +1348,28 @@ class TrafficRoundManager:
                     )
                     continue
 
-                track_ids = boxes.id.int().cpu().tolist()
                 class_ids = boxes.cls.int().cpu().tolist()
                 bboxes = boxes.xyxy.cpu().tolist()
+                if use_tracking:
+                    if boxes.id is None:
+                        with runtime.lock:
+                            runtime.detections_last_frame = 0
+                        self._update_debug_frame(
+                            runtime,
+                            processed_frame,
+                            [],
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                        )
+                        continue
+                    track_ids = boxes.id.int().cpu().tolist()
+                else:
+                    track_ids = [
+                        self._synthetic_track_id(int(class_id), tuple(map(float, bbox)))
+                        for class_id, bbox in zip(class_ids, bboxes)
+                    ]
                 detections_len = len(track_ids)
                 with runtime.lock:
                     runtime.detections_last_frame = detections_len
