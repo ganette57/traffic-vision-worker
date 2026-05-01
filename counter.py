@@ -338,6 +338,13 @@ class RoundRuntime:
     last_reject_reason: Optional[str] = None
     last_debug_frame_jpeg: Optional[bytes] = None
     last_debug_frame_log_at: Optional[float] = None
+    latest_inference_frame: Optional[object] = None
+    latest_inference_frame_idx: int = 0
+    inference_thread: Optional[threading.Thread] = None
+    inference_stop_event: threading.Event = field(default_factory=threading.Event)
+    inference_lock: threading.Lock = field(default_factory=threading.Lock)
+    inference_busy: bool = False
+    last_inference_at: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> Dict[str, object]:
@@ -520,6 +527,10 @@ class TrafficRoundManager:
                 runtime.stop_reason = reason
 
         runtime.stop_event.set()
+        runtime.inference_stop_event.set()
+        if runtime.inference_thread and runtime.inference_thread.is_alive():
+            runtime.inference_thread.join(timeout=0.5)
+        runtime.inference_thread = None
         if runtime.thread and runtime.thread.is_alive():
             runtime.thread.join(timeout=1.0)
 
@@ -977,8 +988,157 @@ class TrafficRoundManager:
                     },
                 )
 
+    def _get_async_line_geometry(self, runtime: RoundRuntime, frame_width: int, frame_height: int) -> Tuple[float, float, float, float]:
+        with runtime.lock:
+            line_x = runtime.counting_line_x
+            line_y = runtime.counting_line_y
+        if line_x is not None and line_y is None:
+            clamped_x = _clamp_int(int(line_x), 0, max(0, frame_width - 1))
+            return float(clamped_x), 0.0, float(clamped_x), float(max(0, frame_height - 1))
+        if line_y is not None and line_x is None:
+            clamped_y = _clamp_int(int(line_y), 0, max(0, frame_height - 1))
+            return 0.0, float(clamped_y), float(max(0, frame_width - 1)), float(clamped_y)
+        fallback_x = float(max(0, frame_width - 1) // 2)
+        return fallback_x, 0.0, fallback_x, float(max(0, frame_height - 1))
+
+    def _run_async_inference(
+        self,
+        runtime: RoundRuntime,
+        model: YOLO,
+        line_margin_px: float,
+        cooldown_frames: int,
+    ) -> None:
+        while not runtime.stop_event.is_set() and not runtime.inference_stop_event.is_set():
+            frame_for_inference = None
+            frame_idx = 0
+            with runtime.inference_lock:
+                if (not runtime.inference_busy) and runtime.latest_inference_frame is not None:
+                    frame_for_inference = runtime.latest_inference_frame
+                    frame_idx = int(runtime.latest_inference_frame_idx)
+                    runtime.latest_inference_frame = None
+                    runtime.inference_busy = True
+            if frame_for_inference is None:
+                time.sleep(0.01)
+                continue
+
+            print(
+                "[traffic-vision-worker] async inference start",
+                {"roundId": runtime.spec.round_id, "frame": int(frame_idx)},
+            )
+            started_at = time.time()
+            try:
+                results = model.predict(
+                    frame_for_inference,
+                    classes=runtime.spec.class_ids,
+                    conf=SETTINGS.conf_threshold,
+                    iou=SETTINGS.iou_threshold,
+                    verbose=False,
+                )
+            except Exception as inference_error:
+                print(
+                    "[traffic-vision-worker] async inference error",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "frame": int(frame_idx),
+                        "error": str(inference_error),
+                    },
+                )
+                with runtime.inference_lock:
+                    runtime.inference_busy = False
+                time.sleep(0.01)
+                continue
+
+            line_x1, line_y1, line_x2, line_y2 = self._get_async_line_geometry(
+                runtime,
+                int(frame_for_inference.shape[1]),
+                int(frame_for_inference.shape[0]),
+            )
+            with runtime.lock:
+                roi_x1 = runtime.counting_roi_x1
+                roi_y1 = runtime.counting_roi_y1
+                roi_x2 = runtime.counting_roi_x2
+                roi_y2 = runtime.counting_roi_y2
+
+            debug_detections: List[Dict[str, object]] = []
+            detections_len = 0
+            if results:
+                first = results[0]
+                boxes = getattr(first, "boxes", None)
+                if boxes is not None and boxes.cls is not None and boxes.xyxy is not None:
+                    class_ids = boxes.cls.int().cpu().tolist()
+                    bboxes = boxes.xyxy.cpu().tolist()
+                    track_ids = [
+                        self._synthetic_track_id(int(class_id), tuple(map(float, bbox)))
+                        for class_id, bbox in zip(class_ids, bboxes)
+                    ]
+                    detections_len = len(track_ids)
+                    for track_id_raw, class_id_raw, bbox in zip(track_ids, class_ids, bboxes):
+                        track_id = int(track_id_raw)
+                        class_id = int(class_id_raw)
+                        if class_id not in runtime.spec.class_ids:
+                            continue
+                        x_min, y_min, x_max, y_max = bbox
+                        bbox_tuple = (float(x_min), float(y_min), float(x_max), float(y_max))
+                        center_x, center_y = self._get_track_point(bbox_tuple)
+                        in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
+                        side = self._maybe_count_simple_line_touch(
+                            runtime,
+                            track_id,
+                            class_id,
+                            bbox_tuple,
+                            center_x,
+                            center_y,
+                            in_roi,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                            line_margin_px,
+                            frame_idx,
+                            cooldown_frames,
+                        )
+                        debug_detections.append(
+                            {
+                                "track_id": track_id,
+                                "class_id": class_id,
+                                "bbox": (float(x_min), float(y_min), float(x_max), float(y_max)),
+                                "point_x": int(center_x),
+                                "point_y": int(center_y),
+                                "side": side,
+                                "in_roi": in_roi,
+                            }
+                        )
+
+            with runtime.lock:
+                runtime.detections_last_frame = int(detections_len)
+                current_count = int(runtime.current_count)
+
+            self._update_debug_frame(
+                runtime,
+                frame_for_inference,
+                debug_detections,
+                line_x1,
+                line_y1,
+                line_x2,
+                line_y2,
+            )
+
+            elapsed_ms = int((time.time() - started_at) * 1000.0)
+            print(
+                "[traffic-vision-worker] async inference done",
+                {
+                    "roundId": runtime.spec.round_id,
+                    "frame": int(frame_idx),
+                    "detections": int(detections_len),
+                    "currentCount": current_count,
+                    "elapsedMs": elapsed_ms,
+                },
+            )
+            with runtime.inference_lock:
+                runtime.inference_busy = False
+
     def _run_round(self, runtime: RoundRuntime) -> None:
-        model = self._get_model()
+        model: Optional[YOLO] = None
         source_candidates: List[str] = []
         default_source = str(runtime.spec.stream_url or "").strip()
         debug_source = str(SETTINGS.debug_video_file or "").strip()
@@ -1057,6 +1217,11 @@ class TrafficRoundManager:
                     runtime.track_in_line_band_by_id.clear()
                     runtime.track_samples_by_id.clear()
                     runtime.simple_counted_key_last_frame.clear()
+                    runtime.latest_inference_frame = None
+                    runtime.latest_inference_frame_idx = 0
+                    runtime.inference_busy = False
+                    runtime.last_inference_at = None
+                    runtime.inference_thread = None
                 print(
                     "[traffic-vision-worker] worker round stopped",
                     {
@@ -1134,6 +1299,11 @@ class TrafficRoundManager:
                 runtime.track_in_line_band_by_id.clear()
                 runtime.track_samples_by_id.clear()
                 runtime.simple_counted_key_last_frame.clear()
+                runtime.latest_inference_frame = None
+                runtime.latest_inference_frame_idx = 0
+                runtime.inference_busy = False
+                runtime.last_inference_at = None
+                runtime.inference_thread = None
             print(
                 "[traffic-vision-worker] worker round stopped",
                 {
@@ -1163,6 +1333,36 @@ class TrafficRoundManager:
                 "[traffic-vision-worker] inference disabled (live-only mode)",
                 {"roundId": runtime.spec.round_id},
             )
+        else:
+            if SETTINGS.async_inference:
+                try:
+                    model = self._get_model()
+                except Exception as model_error:
+                    model = None
+                    print(
+                        "[traffic-vision-worker] model load failed, continuing camera-only",
+                        {"roundId": runtime.spec.round_id, "error": str(model_error)},
+                    )
+                if model is not None:
+                    runtime.inference_stop_event.clear()
+                    inference_thread = threading.Thread(
+                        target=self._run_async_inference,
+                        args=(
+                            runtime,
+                            model,
+                            remote_line_margin_px,
+                            int(SETTINGS.simple_count_cooldown_frames),
+                        ),
+                        daemon=True,
+                        name=f"traffic-inference-{runtime.spec.round_id}",
+                    )
+                    runtime.inference_thread = inference_thread
+                    inference_thread.start()
+            else:
+                print(
+                    "[traffic-vision-worker] async inference disabled, camera-only mode",
+                    {"roundId": runtime.spec.round_id},
+                )
 
         frame_idx = 0
         processed_frame_idx = 0
@@ -1181,13 +1381,12 @@ class TrafficRoundManager:
         roi_x2: Optional[int] = None
         roi_y2: Optional[int] = None
         line_metrics_logged = False
-        tracker_cfg = "bytetrack.yaml"
-        use_tracking = bool(SETTINGS.use_tracking)
-        use_simple_line_touch_count = bool(SETTINGS.simple_line_touch_count)
-        simple_count_cooldown_frames = int(SETTINGS.simple_count_cooldown_frames)
-        inference_slow_sec = max(0.1, float(os.getenv("TRAFFIC_INFERENCE_SLOW_SEC", "2.5")))
-        if str(runtime.spec.tracker or "").strip().lower() in ("bytetrack", "bytetrack.yaml"):
-            tracker_cfg = "bytetrack.yaml"
+        use_async_inference = (
+            (not SETTINGS.disable_inference)
+            and bool(SETTINGS.async_inference)
+            and (runtime.inference_thread is not None)
+        )
+        inference_interval = 1.0 / max(0.1, float(SETTINGS.inference_fps))
 
         try:
             while not runtime.stop_event.is_set():
@@ -1407,311 +1606,42 @@ class TrafficRoundManager:
                         {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
 
-                inference_elapsed = 0.0
-                if SETTINGS.disable_inference:
-                    results = []
-                else:
-                    if should_log_tick:
+                if use_async_inference:
+                    should_enqueue = False
+                    with runtime.inference_lock:
+                        if (
+                            (not runtime.inference_busy)
+                            and (
+                                runtime.last_inference_at is None
+                                or (now - runtime.last_inference_at) >= inference_interval
+                            )
+                        ):
+                            runtime.latest_inference_frame = processed_frame.copy()
+                            runtime.latest_inference_frame_idx = int(processed_frame_idx)
+                            runtime.last_inference_at = now
+                            should_enqueue = True
+                    if should_enqueue and should_log_tick:
                         print(
-                            "[traffic-vision-worker] model.track start"
-                            if use_tracking
-                            else "[traffic-vision-worker] model.predict start",
+                            "[traffic-vision-worker] async inference frame queued",
                             {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                         )
-                    inference_started_at = time.time()
-                    try:
-                        if use_tracking:
-                            results = model.track(
-                                processed_frame,
-                                persist=True,
-                                tracker=tracker_cfg,
-                                classes=runtime.spec.class_ids,
-                                conf=SETTINGS.conf_threshold,
-                                iou=SETTINGS.iou_threshold,
-                                verbose=False,
-                            )
-                        else:
-                            results = model.predict(
-                                processed_frame,
-                                classes=runtime.spec.class_ids,
-                                conf=SETTINGS.conf_threshold,
-                                iou=SETTINGS.iou_threshold,
-                                verbose=False,
-                            )
-                    except Exception as track_error:
-                        print(
-                            "[traffic-vision-worker] frame processing error",
-                            {
-                                "roundId": runtime.spec.round_id,
-                                "frame": processed_frame_idx,
-                                "error": str(track_error),
-                            },
-                        )
-                        self._update_debug_frame(
-                            runtime,
-                            processed_frame,
-                            [],
-                            line_x1,
-                            line_y1,
-                            line_x2,
-                            line_y2,
-                        )
-                        time.sleep(0.01)
-                        continue
-                    inference_elapsed = time.time() - inference_started_at
-                    print(
-                        "[traffic-vision-worker] model inference done",
-                        {
-                            "roundId": runtime.spec.round_id,
-                            "frame": processed_frame_idx,
-                            "useTracking": use_tracking,
-                            "elapsedMs": int(inference_elapsed * 1000.0),
-                        },
-                    )
-                    if should_log_tick:
-                        print(
-                            "[traffic-vision-worker] model.track done"
-                            if use_tracking
-                            else "[traffic-vision-worker] model.predict done",
-                            {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
-                        )
-                    if inference_elapsed > inference_slow_sec:
-                        print(
-                            "[traffic-vision-worker] inference too slow, skipping post-processing",
-                            {
-                                "roundId": runtime.spec.round_id,
-                                "frame": processed_frame_idx,
-                                "elapsedMs": int(inference_elapsed * 1000.0),
-                                "thresholdMs": int(inference_slow_sec * 1000.0),
-                            },
-                        )
-                        continue
-
-                if not results:
-                    with runtime.lock:
-                        runtime.detections_last_frame = 0
-                    self._update_debug_frame(
-                        runtime,
-                        processed_frame,
-                        [],
-                        line_x1,
-                        line_y1,
-                        line_x2,
-                        line_y2,
-                    )
-                    continue
-
-                first = results[0]
-                boxes = getattr(first, "boxes", None)
-                if boxes is None:
-                    with runtime.lock:
-                        runtime.detections_last_frame = 0
-                    self._update_debug_frame(
-                        runtime,
-                        processed_frame,
-                        [],
-                        line_x1,
-                        line_y1,
-                        line_x2,
-                        line_y2,
-                    )
-                    continue
-                if boxes.cls is None or boxes.xyxy is None:
-                    with runtime.lock:
-                        runtime.detections_last_frame = 0
-                    self._update_debug_frame(
-                        runtime,
-                        processed_frame,
-                        [],
-                        line_x1,
-                        line_y1,
-                        line_x2,
-                        line_y2,
-                    )
-                    continue
-
-                class_ids = boxes.cls.int().cpu().tolist()
-                bboxes = boxes.xyxy.cpu().tolist()
-                if use_tracking:
-                    if boxes.id is None:
-                        with runtime.lock:
-                            runtime.detections_last_frame = 0
-                        self._update_debug_frame(
-                            runtime,
-                            processed_frame,
-                            [],
-                            line_x1,
-                            line_y1,
-                            line_x2,
-                            line_y2,
-                        )
-                        continue
-                    track_ids = boxes.id.int().cpu().tolist()
                 else:
-                    track_ids = [
-                        self._synthetic_track_id(int(class_id), tuple(map(float, bbox)))
-                        for class_id, bbox in zip(class_ids, bboxes)
-                    ]
-                detections_len = len(track_ids)
-                with runtime.lock:
-                    runtime.detections_last_frame = detections_len
-
-                if should_log_tick:
-                    print(
-                        "[traffic-vision-worker] detections parsed",
-                        {
-                            "roundId": runtime.spec.round_id,
-                            "frame": processed_frame_idx,
-                            "detections": detections_len,
-                            "tracks": len(track_ids),
-                        },
-                    )
-
-                if detections_len > 0 or should_log_tick:
-                    print(
-                        "[traffic-vision-worker] detections count per frame",
-                        {
-                            "roundId": runtime.spec.round_id,
-                            "frame": processed_frame_idx,
-                            "detections": detections_len,
-                        },
-                    )
-
-                debug_detections: List[Dict[str, object]] = []
-                for track_id_raw, class_id_raw, bbox in zip(track_ids, class_ids, bboxes):
-                    track_id = int(track_id_raw)
-                    class_id = int(class_id_raw)
-                    if class_id not in runtime.spec.class_ids:
-                        continue
-
-                    x_min, y_min, x_max, y_max = bbox
-                    bbox_tuple = (float(x_min), float(y_min), float(x_max), float(y_max))
-                    bbox_area = max(0.0, (float(x_max) - float(x_min)) * (float(y_max) - float(y_min)))
-                    center_x, center_y = self._get_track_point(bbox_tuple)
-                    in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
-                    if use_tracking:
-                        side = self._maybe_count_track(
-                            runtime,
-                            track_id,
-                            class_id,
-                            bbox_tuple,
-                            bbox_area,
-                            line_x1,
-                            line_y1,
-                            line_x2,
-                            line_y2,
-                            roi_x1,
-                            roi_y1,
-                            roi_x2,
-                            roi_y2,
-                            remote_min_samples,
-                            remote_min_motion_px,
-                            remote_min_bbox_area_px,
-                            remote_line_margin_px,
-                            processed_frame_idx,
-                        )
-                    elif use_simple_line_touch_count:
-                        side = self._maybe_count_simple_line_touch(
-                            runtime,
-                            track_id,
-                            class_id,
-                            bbox_tuple,
-                            center_x,
-                            center_y,
-                            in_roi,
-                            line_x1,
-                            line_y1,
-                            line_x2,
-                            line_y2,
-                            remote_line_margin_px,
-                            processed_frame_idx,
-                            simple_count_cooldown_frames,
-                        )
-                    else:
-                        side = self._get_effective_side(
-                            center_x,
-                            center_y,
-                            line_x1,
-                            line_y1,
-                            line_x2,
-                            line_y2,
-                            remote_line_margin_px,
-                        )
-                    debug_detections.append(
-                        {
-                            "track_id": track_id,
-                            "class_id": class_id,
-                            "bbox": (float(x_min), float(y_min), float(x_max), float(y_max)),
-                            "point_x": int(center_x),
-                            "point_y": int(center_y),
-                            "side": side,
-                            "in_roi": in_roi,
-                        }
-                    )
-
-                with runtime.lock:
-                    current_count = int(runtime.current_count)
-
-                if should_log_tick:
-                    print(
-                        "[traffic-vision-worker] counting complete",
-                        {
-                            "roundId": runtime.spec.round_id,
-                            "frame": processed_frame_idx,
-                            "detections": detections_len,
-                            "tracks": len(track_ids),
-                            "currentCount": current_count,
-                        },
-                    )
-
-                if processed_frame_idx % 30 == 0:
-                    self._cleanup_stale_tracks(runtime, processed_frame_idx)
-                    if resource is not None:
-                        try:
-                            usage = resource.getrusage(resource.RUSAGE_SELF)
-                            print(
-                                "[traffic-vision-worker] memory usage",
-                                {
-                                    "roundId": runtime.spec.round_id,
-                                    "frame": processed_frame_idx,
-                                    "ruMaxRss": int(getattr(usage, "ru_maxrss", 0)),
-                                },
-                            )
-                        except Exception:
-                            pass
-
-                if DEBUG_CROSSING and processed_frame_idx % 30 == 0 and detections_len > 0:
                     with runtime.lock:
-                        use_y_axis = runtime.counting_line_y is not None and runtime.counting_line_x is None
-                        dbg_parts = []
-                        for det in debug_detections:
-                            tid = det["track_id"]
-                            c_axis = det["point_y"] if use_y_axis else det["point_x"]
-                            s = det["side"]
-                            hist = runtime.track_point_history.get(tid, [])
-                            counted = "Y" if tid in runtime.counted_track_ids else "N"
-                            samp = len(hist)
-                            movement = self._get_track_motion(hist)
-                            dbg_parts.append(
-                                f"T{tid}:p={c_axis},z={s},s={samp},m={movement:.1f},c={counted}"
-                            )
-                        l_axis = runtime.counting_line_y if use_y_axis else runtime.counting_line_x
-                        cc = runtime.current_count
-                    print(
-                        f"[CROSSING_DEBUG] f={processed_frame_idx} l={l_axis or 0} cnt={cc} det={detections_len} "
-                        + " | ".join(dbg_parts[:8])
-                    )
+                        runtime.detections_last_frame = 0
 
                 self._update_debug_frame(
                     runtime,
                     processed_frame,
-                    debug_detections,
+                    [],
                     line_x1,
                     line_y1,
                     line_x2,
                     line_y2,
                 )
         finally:
+            runtime.inference_stop_event.set()
+            if runtime.inference_thread and runtime.inference_thread.is_alive():
+                runtime.inference_thread.join(timeout=0.5)
             cap.release()
             with runtime.lock:
                 if runtime.status == "running":
@@ -1727,6 +1657,11 @@ class TrafficRoundManager:
                 runtime.track_in_line_band_by_id.clear()
                 runtime.track_samples_by_id.clear()
                 runtime.simple_counted_key_last_frame.clear()
+                runtime.latest_inference_frame = None
+                runtime.latest_inference_frame_idx = 0
+                runtime.inference_busy = False
+                runtime.last_inference_at = None
+                runtime.inference_thread = None
 
             print(
                 "[traffic-vision-worker] worker round stopped",
