@@ -340,6 +340,10 @@ class RoundRuntime:
     last_debug_frame_log_at: Optional[float] = None
     latest_inference_frame: Optional[object] = None
     latest_inference_frame_idx: int = 0
+    latest_async_debug_detections: List[Dict[str, object]] = field(default_factory=list)
+    previous_gray_frame: Optional[object] = None
+    motion_counted_buckets_last_frame: Dict[str, int] = field(default_factory=dict)
+    latest_motion_debug_detections: List[Dict[str, object]] = field(default_factory=list)
     inference_thread: Optional[threading.Thread] = None
     inference_stop_event: threading.Event = field(default_factory=threading.Event)
     inference_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -635,27 +639,6 @@ class TrafficRoundManager:
         distance = _line_signed_distance(float(point_x), float(point_y), line_x1, line_y1, line_x2, line_y2)
         return abs(distance) <= margin
 
-    def _build_simple_count_key(
-        self,
-        class_id: int,
-        point_x: float,
-        point_y: float,
-        side: int,
-        line_x1: float,
-        line_y1: float,
-        line_x2: float,
-        line_y2: float,
-    ) -> str:
-        bucket_x = int(float(point_x) // 48.0)
-        bucket_y = int(float(point_y) // 48.0)
-        if abs(line_y1 - line_y2) <= 1.0 and abs(line_x1 - line_x2) > 1.0:
-            region = f"h:{bucket_x}"
-        elif abs(line_x1 - line_x2) <= 1.0 and abs(line_y1 - line_y2) > 1.0:
-            region = f"v:{bucket_y}"
-        else:
-            region = f"s:{bucket_x}:{bucket_y}"
-        return f"{int(class_id)}|{region}|{int(side)}"
-
     def _maybe_count_simple_line_touch(
         self,
         runtime: RoundRuntime,
@@ -672,7 +655,7 @@ class TrafficRoundManager:
         line_margin_px: float,
         frame_idx: int,
         cooldown_frames: int,
-    ) -> int:
+    ) -> Tuple[int, bool]:
         side = self._get_effective_side(
             point_x,
             point_y,
@@ -683,33 +666,29 @@ class TrafficRoundManager:
             line_margin_px,
         )
         if not in_roi:
-            return side
-        if not self._is_line_touch(
-            bbox,
-            point_x,
-            point_y,
-            line_x1,
-            line_y1,
-            line_x2,
-            line_y2,
-            line_margin_px,
-        ):
-            return side
+            return side, False
 
-        simple_key = self._build_simple_count_key(
-            class_id,
-            point_x,
-            point_y,
-            side,
-            line_x1,
-            line_y1,
-            line_x2,
-            line_y2,
+        line_y = (float(line_y1) + float(line_y2)) / 2.0
+        distance = abs(float(point_y) - float(line_y))
+        if distance > float(line_margin_px):
+            return side, False
+        print(
+            "[Traffic][LINE_TOUCH]",
+            {
+                "roundId": runtime.spec.round_id,
+                "frame": int(frame_idx),
+                "centerX": int(point_x),
+                "centerY": int(point_y),
+                "lineY": int(round(line_y)),
+                "distance": float(distance),
+            },
         )
+
+        simple_key = f"{int(class_id)}|{int(float(point_x) // 80.0)}"
         current_count: Optional[int] = None
         with runtime.lock:
             if runtime.status != "running" or runtime.stop_event.is_set():
-                return side
+                return side, True
             expired_keys = [
                 key
                 for key, last_seen_frame in runtime.simple_counted_key_last_frame.items()
@@ -718,7 +697,7 @@ class TrafficRoundManager:
             for key in expired_keys:
                 runtime.simple_counted_key_last_frame.pop(key, None)
             if simple_key in runtime.simple_counted_key_last_frame:
-                return side
+                return side, True
             runtime.simple_counted_key_last_frame[simple_key] = int(frame_idx)
             runtime.current_count += 1
             runtime.last_counted_track_id = int(track_id)
@@ -726,16 +705,8 @@ class TrafficRoundManager:
             runtime.last_reject_reason = None
             current_count = int(runtime.current_count)
 
-        print(
-            "[traffic-vision-worker] simple line touch counted",
-            {
-                "roundId": runtime.spec.round_id,
-                "frame": int(frame_idx),
-                "class": COCO_CLASS_ID_TO_NAME.get(class_id, str(class_id)),
-                "currentCount": current_count,
-            },
-        )
-        return side
+        print("[Traffic][COUNT_PLUS_ONE]", {"roundId": runtime.spec.round_id, "currentCount": current_count})
+        return side, True
 
     def _commit_count(
         self,
@@ -1061,6 +1032,7 @@ class TrafficRoundManager:
 
             debug_detections: List[Dict[str, object]] = []
             detections_len = 0
+            touched_any = False
             if results:
                 first = results[0]
                 boxes = getattr(first, "boxes", None)
@@ -1081,7 +1053,7 @@ class TrafficRoundManager:
                         bbox_tuple = (float(x_min), float(y_min), float(x_max), float(y_max))
                         center_x, center_y = self._get_track_point(bbox_tuple)
                         in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
-                        side = self._maybe_count_simple_line_touch(
+                        side, touched = self._maybe_count_simple_line_touch(
                             runtime,
                             track_id,
                             class_id,
@@ -1097,6 +1069,8 @@ class TrafficRoundManager:
                             frame_idx,
                             cooldown_frames,
                         )
+                        if touched:
+                            touched_any = True
                         debug_detections.append(
                             {
                                 "track_id": track_id,
@@ -1111,7 +1085,17 @@ class TrafficRoundManager:
 
             with runtime.lock:
                 runtime.detections_last_frame = int(detections_len)
+                runtime.latest_async_debug_detections = list(debug_detections)
                 current_count = int(runtime.current_count)
+            print(
+                "[Traffic][DETECTIONS]",
+                {"roundId": runtime.spec.round_id, "frame": int(frame_idx), "detections": int(detections_len)},
+            )
+            if detections_len > 0 and not touched_any:
+                print(
+                    "[Traffic][NO_TOUCH]",
+                    {"roundId": runtime.spec.round_id, "frame": int(frame_idx), "detections": int(detections_len)},
+                )
 
             self._update_debug_frame(
                 runtime,
@@ -1136,6 +1120,123 @@ class TrafficRoundManager:
             )
             with runtime.inference_lock:
                 runtime.inference_busy = False
+
+    def _run_motion_line_count(
+        self,
+        runtime: RoundRuntime,
+        frame,
+        frame_idx: int,
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+        roi_x1: Optional[int],
+        roi_y1: Optional[int],
+        roi_x2: Optional[int],
+        roi_y2: Optional[int],
+    ) -> None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        with runtime.lock:
+            previous_gray = runtime.previous_gray_frame
+            runtime.previous_gray_frame = gray
+        if previous_gray is None:
+            with runtime.lock:
+                runtime.latest_motion_debug_detections = []
+                runtime.detections_last_frame = 0
+            return
+
+        delta = cv2.absdiff(previous_gray, gray)
+        thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
+        thresh = cv2.dilate(thresh, None, iterations=2)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        line_y = int(round((float(line_y1) + float(line_y2)) / 2.0))
+        margin = float(SETTINGS.motion_line_margin_px)
+        min_area = float(SETTINGS.motion_min_area)
+        cooldown = int(SETTINGS.motion_cooldown_frames)
+        blobs = 0
+        debug_detections: List[Dict[str, object]] = []
+
+        with runtime.lock:
+            expired = [
+                key
+                for key, seen_frame in runtime.motion_counted_buckets_last_frame.items()
+                if (int(frame_idx) - int(seen_frame)) > cooldown
+            ]
+            for key in expired:
+                runtime.motion_counted_buckets_last_frame.pop(key, None)
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area:
+                continue
+            blobs += 1
+            x, y, w, h = cv2.boundingRect(contour)
+            center_x = float(x) + (float(w) / 2.0)
+            center_y = float(y) + (float(h) / 2.0)
+            in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
+            side = self._get_effective_side(
+                center_x,
+                center_y,
+                line_x1,
+                line_y1,
+                line_x2,
+                line_y2,
+                margin,
+            )
+            touches_line = (
+                abs(center_y - float(line_y)) <= margin
+                or (
+                    float(y) <= (float(line_y) + margin)
+                    and float(y + h) >= (float(line_y) - margin)
+                )
+            )
+            if in_roi and touches_line:
+                print(
+                    "[Traffic][MOTION_TOUCH]",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "frame": int(frame_idx),
+                        "centerX": int(center_x),
+                        "centerY": int(center_y),
+                        "lineY": int(line_y),
+                        "area": area,
+                    },
+                )
+                bucket_key = str(int(center_x // 80.0))
+                with runtime.lock:
+                    last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
+                    if last_seen is None or (int(frame_idx) - int(last_seen)) > cooldown:
+                        runtime.motion_counted_buckets_last_frame[bucket_key] = int(frame_idx)
+                        runtime.current_count += 1
+                        runtime.last_counted_track_id = int(center_x)
+                        runtime.last_crossing_direction = "motion_line_touch"
+                        runtime.last_reject_reason = None
+                        current_count = int(runtime.current_count)
+                        print(
+                            "[Traffic][COUNT_PLUS_ONE]",
+                            {"roundId": runtime.spec.round_id, "currentCount": current_count},
+                        )
+
+            debug_detections.append(
+                {
+                    "track_id": int(center_x),
+                    "class_id": 2,
+                    "bbox": (float(x), float(y), float(x + w), float(y + h)),
+                    "point_x": int(center_x),
+                    "point_y": int(center_y),
+                    "side": int(side),
+                    "in_roi": bool(in_roi),
+                }
+            )
+
+        print(
+            "[Traffic][MOTION_BLOBS]",
+            {"roundId": runtime.spec.round_id, "frame": int(frame_idx), "blobs": int(blobs)},
+        )
+        with runtime.lock:
+            runtime.latest_motion_debug_detections = debug_detections
+            runtime.detections_last_frame = int(blobs)
 
     def _run_round(self, runtime: RoundRuntime) -> None:
         model: Optional[YOLO] = None
@@ -1219,6 +1320,10 @@ class TrafficRoundManager:
                     runtime.simple_counted_key_last_frame.clear()
                     runtime.latest_inference_frame = None
                     runtime.latest_inference_frame_idx = 0
+                    runtime.latest_async_debug_detections.clear()
+                    runtime.previous_gray_frame = None
+                    runtime.motion_counted_buckets_last_frame.clear()
+                    runtime.latest_motion_debug_detections.clear()
                     runtime.inference_busy = False
                     runtime.last_inference_at = None
                     runtime.inference_thread = None
@@ -1301,6 +1406,10 @@ class TrafficRoundManager:
                 runtime.simple_counted_key_last_frame.clear()
                 runtime.latest_inference_frame = None
                 runtime.latest_inference_frame_idx = 0
+                runtime.latest_async_debug_detections.clear()
+                runtime.previous_gray_frame = None
+                runtime.motion_counted_buckets_last_frame.clear()
+                runtime.latest_motion_debug_detections.clear()
                 runtime.inference_busy = False
                 runtime.last_inference_at = None
                 runtime.inference_thread = None
@@ -1334,7 +1443,12 @@ class TrafficRoundManager:
                 {"roundId": runtime.spec.round_id},
             )
         else:
-            if SETTINGS.async_inference:
+            if SETTINGS.motion_line_count:
+                print(
+                    "[traffic-vision-worker] motion line count enabled (opencv-only mode)",
+                    {"roundId": runtime.spec.round_id},
+                )
+            elif SETTINGS.async_inference:
                 try:
                     model = self._get_model()
                 except Exception as model_error:
@@ -1350,7 +1464,7 @@ class TrafficRoundManager:
                         args=(
                             runtime,
                             model,
-                            remote_line_margin_px,
+                            float(SETTINGS.line_margin_px),
                             int(SETTINGS.simple_count_cooldown_frames),
                         ),
                         daemon=True,
@@ -1381,8 +1495,10 @@ class TrafficRoundManager:
         roi_x2: Optional[int] = None
         roi_y2: Optional[int] = None
         line_metrics_logged = False
+        use_motion_line_count = (not SETTINGS.disable_inference) and bool(SETTINGS.motion_line_count)
         use_async_inference = (
             (not SETTINGS.disable_inference)
+            and (not use_motion_line_count)
             and bool(SETTINGS.async_inference)
             and (runtime.inference_thread is not None)
         )
@@ -1441,24 +1557,12 @@ class TrafficRoundManager:
                 if SETTINGS.disable_inference:
                     should_process = True
                     should_store_debug = True
-                raw_ok = False
-                raw_bytes = b""
                 if not should_process and not should_store_debug:
                     time.sleep(0.005)
                     continue
 
                 if should_store_debug:
-                    raw_ok, raw_encoded = cv2.imencode(
-                        ".jpg",
-                        processed_frame,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 80],
-                    )
-                    if raw_ok:
-                        raw_bytes = raw_encoded.tobytes()
-                        with runtime.lock:
-                            runtime.last_debug_frame_jpeg = raw_bytes
-                            runtime.last_frame_at = now
-                        last_debug_frame_store_at = now
+                    last_debug_frame_store_at = now
 
                 if frame_width > 0 and frame_height > 0:
                     if source_type == "remote_stream":
@@ -1565,6 +1669,21 @@ class TrafficRoundManager:
                         line_metrics_logged = True
 
                 if not should_process:
+                    if should_store_debug:
+                        with runtime.lock:
+                            if use_motion_line_count:
+                                debug_detections_for_frame = list(runtime.latest_motion_debug_detections)
+                            else:
+                                debug_detections_for_frame = list(runtime.latest_async_debug_detections)
+                        self._update_debug_frame(
+                            runtime,
+                            processed_frame,
+                            debug_detections_for_frame,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                        )
                     continue
 
                 processed_frame_idx += 1
@@ -1578,15 +1697,6 @@ class TrafficRoundManager:
                         "[traffic-vision-worker] frame loop tick",
                         {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
-                    if should_store_debug and raw_ok:
-                        print(
-                            "[traffic-vision-worker] raw live frame stored",
-                            {
-                                "roundId": runtime.spec.round_id,
-                                "frame": processed_frame_idx,
-                                "bytes": len(raw_bytes),
-                            },
-                        )
 
                 if processed_frame_idx <= 3 or (
                     SETTINGS.frame_log_interval > 0
@@ -1604,6 +1714,21 @@ class TrafficRoundManager:
                     print(
                         "[traffic-vision-worker] frame processing active",
                         {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
+                    )
+
+                if use_motion_line_count:
+                    self._run_motion_line_count(
+                        runtime,
+                        processed_frame,
+                        processed_frame_idx,
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                        roi_x1,
+                        roi_y1,
+                        roi_x2,
+                        roi_y2,
                     )
 
                 if use_async_inference:
@@ -1627,12 +1752,18 @@ class TrafficRoundManager:
                         )
                 else:
                     with runtime.lock:
-                        runtime.detections_last_frame = 0
+                        if not use_motion_line_count:
+                            runtime.detections_last_frame = 0
+                with runtime.lock:
+                    if use_motion_line_count:
+                        debug_detections_for_frame = list(runtime.latest_motion_debug_detections)
+                    else:
+                        debug_detections_for_frame = list(runtime.latest_async_debug_detections)
 
                 self._update_debug_frame(
                     runtime,
                     processed_frame,
-                    [],
+                    debug_detections_for_frame,
                     line_x1,
                     line_y1,
                     line_x2,
@@ -1659,6 +1790,10 @@ class TrafficRoundManager:
                 runtime.simple_counted_key_last_frame.clear()
                 runtime.latest_inference_frame = None
                 runtime.latest_inference_frame_idx = 0
+                runtime.latest_async_debug_detections.clear()
+                runtime.previous_gray_frame = None
+                runtime.motion_counted_buckets_last_frame.clear()
+                runtime.latest_motion_debug_detections.clear()
                 runtime.inference_busy = False
                 runtime.last_inference_at = None
                 runtime.inference_thread = None
