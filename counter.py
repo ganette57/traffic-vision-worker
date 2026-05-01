@@ -85,6 +85,7 @@ IOWA_STREAM_SIGNATURE = "iowadotsfs2.us-east-1.skyvdn.com/rtplive/dmtv05lb"
 MARYLAND_STREAM_SIGNATURE = "strmr5.sha.maryland.gov/rtplive/0900adbd00ee00e30051fa36c4235c0a"
 LAS_VEGAS_STREAM_URL = "https://videos-3.earthcam.com/fecnetwork/42116.flv/chunklist_w554170088.m3u8?t=UGa97G27%2BOZQYx%2FZGv8bHLblEJHHKvee7g9yK8V46vLMi6ZfhNViHDRNTwaj6Uqq&td=202604051541"
 LAS_VEGAS_STREAM_SIGNATURE = "videos-3.earthcam.com/fecnetwork/42116.flv"
+SUPPORTED_PRODUCTION_CAMERA_IDS = {"cam2", "cam3", "iowa"}
 
 CAMERA_REMOTE_STREAM_PROFILES: Dict[str, Dict[str, object]] = {
     "cam1": {
@@ -283,6 +284,10 @@ def _resolve_remote_profile(camera_id: Optional[str], stream_url: str, round_id:
     }
 
 
+def _is_supported_production_camera(camera_id: str) -> bool:
+    return str(camera_id or "").strip().lower() in SUPPORTED_PRODUCTION_CAMERA_IDS
+
+
 @dataclass
 class RoundSpec:
     round_id: str
@@ -328,6 +333,7 @@ class RoundRuntime:
     track_last_seen_frame_by_id: Dict[int, int] = field(default_factory=dict)
     track_in_line_band_by_id: Dict[int, bool] = field(default_factory=dict)
     track_samples_by_id: Dict[int, int] = field(default_factory=dict)
+    simple_counted_key_last_frame: Dict[str, int] = field(default_factory=dict)
     last_track_samples: Optional[int] = None
     last_reject_reason: Optional[str] = None
     last_debug_frame_jpeg: Optional[bytes] = None
@@ -592,6 +598,130 @@ class TrafficRoundManager:
         if abs(distance) <= max(0.0, float(line_margin_px)):
             return 0
         return 1 if distance > 0.0 else -1
+
+    def _is_line_touch(
+        self,
+        bbox: Tuple[float, float, float, float],
+        point_x: float,
+        point_y: float,
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+        line_margin_px: float,
+    ) -> bool:
+        x_min, y_min, x_max, y_max = bbox
+        margin = max(0.0, float(line_margin_px))
+        if abs(line_y1 - line_y2) <= 1.0 and abs(line_x1 - line_x2) > 1.0:
+            line_y = (float(line_y1) + float(line_y2)) / 2.0
+            return (float(y_min) <= line_y <= float(y_max)) or (abs(float(point_y) - line_y) <= margin)
+        if abs(line_x1 - line_x2) <= 1.0 and abs(line_y1 - line_y2) > 1.0:
+            line_x = (float(line_x1) + float(line_x2)) / 2.0
+            return (float(x_min) <= line_x <= float(x_max)) or (abs(float(point_x) - line_x) <= margin)
+        distance = _line_signed_distance(float(point_x), float(point_y), line_x1, line_y1, line_x2, line_y2)
+        return abs(distance) <= margin
+
+    def _build_simple_count_key(
+        self,
+        class_id: int,
+        point_x: float,
+        point_y: float,
+        side: int,
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+    ) -> str:
+        bucket_x = int(float(point_x) // 48.0)
+        bucket_y = int(float(point_y) // 48.0)
+        if abs(line_y1 - line_y2) <= 1.0 and abs(line_x1 - line_x2) > 1.0:
+            region = f"h:{bucket_x}"
+        elif abs(line_x1 - line_x2) <= 1.0 and abs(line_y1 - line_y2) > 1.0:
+            region = f"v:{bucket_y}"
+        else:
+            region = f"s:{bucket_x}:{bucket_y}"
+        return f"{int(class_id)}|{region}|{int(side)}"
+
+    def _maybe_count_simple_line_touch(
+        self,
+        runtime: RoundRuntime,
+        track_id: int,
+        class_id: int,
+        bbox: Tuple[float, float, float, float],
+        point_x: float,
+        point_y: float,
+        in_roi: bool,
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+        line_margin_px: float,
+        frame_idx: int,
+        cooldown_frames: int,
+    ) -> int:
+        side = self._get_effective_side(
+            point_x,
+            point_y,
+            line_x1,
+            line_y1,
+            line_x2,
+            line_y2,
+            line_margin_px,
+        )
+        if not in_roi:
+            return side
+        if not self._is_line_touch(
+            bbox,
+            point_x,
+            point_y,
+            line_x1,
+            line_y1,
+            line_x2,
+            line_y2,
+            line_margin_px,
+        ):
+            return side
+
+        simple_key = self._build_simple_count_key(
+            class_id,
+            point_x,
+            point_y,
+            side,
+            line_x1,
+            line_y1,
+            line_x2,
+            line_y2,
+        )
+        current_count: Optional[int] = None
+        with runtime.lock:
+            if runtime.status != "running" or runtime.stop_event.is_set():
+                return side
+            expired_keys = [
+                key
+                for key, last_seen_frame in runtime.simple_counted_key_last_frame.items()
+                if (int(frame_idx) - int(last_seen_frame)) > int(cooldown_frames)
+            ]
+            for key in expired_keys:
+                runtime.simple_counted_key_last_frame.pop(key, None)
+            if simple_key in runtime.simple_counted_key_last_frame:
+                return side
+            runtime.simple_counted_key_last_frame[simple_key] = int(frame_idx)
+            runtime.current_count += 1
+            runtime.last_counted_track_id = int(track_id)
+            runtime.last_crossing_direction = f"simple_line_touch_side_{int(side)}"
+            runtime.last_reject_reason = None
+            current_count = int(runtime.current_count)
+
+        print(
+            "[traffic-vision-worker] simple line touch counted",
+            {
+                "roundId": runtime.spec.round_id,
+                "frame": int(frame_idx),
+                "class": COCO_CLASS_ID_TO_NAME.get(class_id, str(class_id)),
+                "currentCount": current_count,
+            },
+        )
+        return side
 
     def _commit_count(
         self,
@@ -858,6 +988,7 @@ class TrafficRoundManager:
         remote_line_margin_px = REMOTE_STREAM_LINE_MARGIN_PX
         remote_profile_id = "default"
         remote_profile_source = "default"
+        resolved_camera_id = ""
 
         if source_type == "remote_stream":
             profile = _resolve_remote_profile(runtime.spec.camera_id, default_source, runtime.spec.round_id)
@@ -900,10 +1031,38 @@ class TrafficRoundManager:
                     "lineMarginPx": remote_line_margin_px,
                 },
             )
-        if source_type == "remote_stream":
             resolved_camera_id = _normalize_camera_id(runtime.spec.camera_id) or _camera_id_from_stream(
                 default_source
             )
+            if resolved_camera_id and not _is_supported_production_camera(resolved_camera_id):
+                with runtime.lock:
+                    runtime.status = "stopped"
+                    runtime.stop_reason = "unsupported_camera"
+                    runtime.source_opened = False
+                    final_count = int(runtime.current_count)
+                    runtime.last_debug_frame_jpeg = None
+                    runtime.counted_track_ids.clear()
+                    runtime.last_side_by_track.clear()
+                    runtime.track_point_history.clear()
+                    runtime.track_last_seen_frame_by_id.clear()
+                    runtime.track_in_line_band_by_id.clear()
+                    runtime.track_samples_by_id.clear()
+                    runtime.simple_counted_key_last_frame.clear()
+                print(
+                    "[traffic-vision-worker] worker round stopped",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "reason": "unsupported_camera",
+                        "cameraId": resolved_camera_id,
+                        "finalCount": final_count,
+                    },
+                )
+                print(
+                    "[traffic-vision-worker] round runtime memory cleaned",
+                    {"roundId": runtime.spec.round_id, "finalCount": final_count},
+                )
+                return
+        if source_type == "remote_stream":
             if resolved_camera_id == "las_vegas":
                 source_candidates.append(LAS_VEGAS_STREAM_URL)
             if default_source and default_source != LAS_VEGAS_STREAM_URL:
@@ -965,6 +1124,7 @@ class TrafficRoundManager:
                 runtime.track_last_seen_frame_by_id.clear()
                 runtime.track_in_line_band_by_id.clear()
                 runtime.track_samples_by_id.clear()
+                runtime.simple_counted_key_last_frame.clear()
             print(
                 "[traffic-vision-worker] worker round stopped",
                 {
@@ -1009,6 +1169,8 @@ class TrafficRoundManager:
         line_metrics_logged = False
         tracker_cfg = "bytetrack.yaml"
         use_tracking = bool(SETTINGS.use_tracking)
+        use_simple_line_touch_count = bool(SETTINGS.simple_line_touch_count)
+        simple_count_cooldown_frames = int(SETTINGS.simple_count_cooldown_frames)
         inference_slow_sec = max(0.1, float(os.getenv("TRAFFIC_INFERENCE_SLOW_SEC", "2.5")))
         if str(runtime.spec.tracker or "").strip().lower() in ("bytetrack", "bytetrack.yaml"):
             tracker_cfg = "bytetrack.yaml"
@@ -1407,26 +1569,54 @@ class TrafficRoundManager:
                     bbox_area = max(0.0, (float(x_max) - float(x_min)) * (float(y_max) - float(y_min)))
                     center_x, center_y = self._get_track_point(bbox_tuple)
                     in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
-                    side = self._maybe_count_track(
-                        runtime,
-                        track_id,
-                        class_id,
-                        bbox_tuple,
-                        bbox_area,
-                        line_x1,
-                        line_y1,
-                        line_x2,
-                        line_y2,
-                        roi_x1,
-                        roi_y1,
-                        roi_x2,
-                        roi_y2,
-                        remote_min_samples,
-                        remote_min_motion_px,
-                        remote_min_bbox_area_px,
-                        remote_line_margin_px,
-                        processed_frame_idx,
-                    )
+                    if use_tracking:
+                        side = self._maybe_count_track(
+                            runtime,
+                            track_id,
+                            class_id,
+                            bbox_tuple,
+                            bbox_area,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                            roi_x1,
+                            roi_y1,
+                            roi_x2,
+                            roi_y2,
+                            remote_min_samples,
+                            remote_min_motion_px,
+                            remote_min_bbox_area_px,
+                            remote_line_margin_px,
+                            processed_frame_idx,
+                        )
+                    elif use_simple_line_touch_count:
+                        side = self._maybe_count_simple_line_touch(
+                            runtime,
+                            track_id,
+                            class_id,
+                            bbox_tuple,
+                            center_x,
+                            center_y,
+                            in_roi,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                            remote_line_margin_px,
+                            processed_frame_idx,
+                            simple_count_cooldown_frames,
+                        )
+                    else:
+                        side = self._get_effective_side(
+                            center_x,
+                            center_y,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                            remote_line_margin_px,
+                        )
                     debug_detections.append(
                         {
                             "track_id": track_id,
@@ -1516,6 +1706,7 @@ class TrafficRoundManager:
                 runtime.track_last_seen_frame_by_id.clear()
                 runtime.track_in_line_band_by_id.clear()
                 runtime.track_samples_by_id.clear()
+                runtime.simple_counted_key_last_frame.clear()
 
             print(
                 "[traffic-vision-worker] worker round stopped",
