@@ -6,7 +6,7 @@ import os
 class WorkerSettings:
     host: str = os.getenv("TRAFFIC_VISION_HOST", "0.0.0.0")
     port: int = int(os.getenv("TRAFFIC_VISION_PORT", "8090"))
-    model_name: str = os.getenv("TRAFFIC_VISION_MODEL", "yolov8s.pt")
+    model_name: str = os.getenv("TRAFFIC_VISION_MODEL", "yolov8n.pt")
     conf_threshold: float = float(os.getenv("TRAFFIC_VISION_CONF", "0.20"))
     iou_threshold: float = float(os.getenv("TRAFFIC_VISION_IOU", "0.45"))
     frame_log_interval: int = int(os.getenv("TRAFFIC_VISION_FRAME_LOG_INTERVAL", "120"))

@@ -382,6 +382,10 @@ class TrafficRoundManager:
         self._lock = threading.Lock()
         self._model_lock = threading.Lock()
         self._model: Optional[YOLO] = None
+        print(
+            "[traffic-vision-worker] startup settings",
+            {"modelName": SETTINGS.model_name},
+        )
 
     def _get_model(self) -> YOLO:
         with self._model_lock:
