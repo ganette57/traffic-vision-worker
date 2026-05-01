@@ -17,9 +17,9 @@ class WorkerSettings:
     allow_concurrent_rounds: bool = os.getenv("TRAFFIC_ALLOW_CONCURRENT_ROUNDS", "0") == "1"
     disable_inference: bool = os.getenv("TRAFFIC_DISABLE_INFERENCE", "0") == "1"
     motion_line_count: bool = os.getenv("TRAFFIC_MOTION_LINE_COUNT", "1") == "1"
-    motion_min_area: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_MIN_AREA", "450")))
-    motion_line_margin_px: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_LINE_MARGIN_PX", "35")))
-    motion_cooldown_frames: int = max(1, int(os.getenv("TRAFFIC_MOTION_COOLDOWN_FRAMES", "45")))
+    motion_min_area: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_MIN_AREA", "1800")))
+    motion_line_margin_px: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_LINE_MARGIN_PX", "10")))
+    motion_cooldown_frames: int = max(1, int(os.getenv("TRAFFIC_MOTION_COOLDOWN_FRAMES", "90")))
     async_inference: bool = os.getenv("TRAFFIC_ASYNC_INFERENCE", "1") == "1"
     inference_fps: float = max(0.1, float(os.getenv("TRAFFIC_INFERENCE_FPS", "0.5")))
     use_tracking: bool = os.getenv("TRAFFIC_USE_TRACKING", "0") == "1"

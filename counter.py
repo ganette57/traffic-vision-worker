@@ -1151,7 +1151,6 @@ class TrafficRoundManager:
         thresh = cv2.dilate(thresh, None, iterations=2)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         line_y = int(round((float(line_y1) + float(line_y2)) / 2.0))
-        margin = float(SETTINGS.motion_line_margin_px)
         min_area = float(SETTINGS.motion_min_area)
         cooldown = int(SETTINGS.motion_cooldown_frames)
         blobs = 0
@@ -1182,15 +1181,35 @@ class TrafficRoundManager:
                 line_y1,
                 line_x2,
                 line_y2,
-                margin,
+                float(SETTINGS.motion_line_margin_px),
             )
-            touches_line = (
-                abs(center_y - float(line_y)) <= margin
-                or (
-                    float(y) <= (float(line_y) + margin)
-                    and float(y + h) >= (float(line_y) - margin)
+            touches_line = float(y) <= float(line_y) <= float(y + h)
+            if not in_roi:
+                print(
+                    "[Traffic][MOTION_REJECT]",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "frame": int(frame_idx),
+                        "centerX": int(center_x),
+                        "centerY": int(center_y),
+                        "lineY": int(line_y),
+                        "area": area,
+                        "reason": "outside_roi",
+                    },
                 )
-            )
+            elif not touches_line:
+                print(
+                    "[Traffic][MOTION_REJECT]",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "frame": int(frame_idx),
+                        "centerX": int(center_x),
+                        "centerY": int(center_y),
+                        "lineY": int(line_y),
+                        "area": area,
+                        "reason": "bbox_does_not_cross_line",
+                    },
+                )
             if in_roi and touches_line:
                 print(
                     "[Traffic][MOTION_TOUCH]",
