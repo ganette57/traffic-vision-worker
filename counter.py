@@ -11,6 +11,11 @@ from ultralytics import YOLO
 
 from config import SETTINGS
 
+try:
+    import resource
+except Exception:
+    resource = None
+
 
 COCO_CLASS_NAME_TO_ID = {
     "car": 2,
@@ -391,13 +396,29 @@ class TrafficRoundManager:
             started_at=now,
             ends_at=now + max(1, int(spec.duration_sec)),
         )
+        threads_to_join: List[threading.Thread] = []
 
         with self._lock:
             previous = self._rounds.get(spec.round_id)
             if previous and previous.status == "running":
                 return previous.snapshot()
 
-            if previous and previous.thread and previous.thread.is_alive():
+            if not SETTINGS.allow_concurrent_rounds:
+                for previous_round_id, running_runtime in self._rounds.items():
+                    with running_runtime.lock:
+                        if running_runtime.status != "running":
+                            continue
+                        running_runtime.status = "stopped"
+                        if running_runtime.stop_reason is None:
+                            running_runtime.stop_reason = "replaced_by_new_round"
+                    running_runtime.stop_event.set()
+                    print(
+                        "[traffic-vision-worker] stopping previous running round before new start",
+                        {"previousRoundId": previous_round_id, "newRoundId": spec.round_id},
+                    )
+                    if running_runtime.thread and running_runtime.thread.is_alive():
+                        threads_to_join.append(running_runtime.thread)
+            elif previous and previous.thread and previous.thread.is_alive():
                 previous.stop_event.set()
 
             thread = threading.Thread(
@@ -409,6 +430,9 @@ class TrafficRoundManager:
             runtime.thread = thread
             self._rounds[spec.round_id] = runtime
             thread.start()
+
+        for previous_thread in threads_to_join:
+            previous_thread.join(timeout=0.5)
 
         print(
             "[traffic-vision-worker] worker round started",
@@ -919,13 +943,25 @@ class TrafficRoundManager:
                 runtime.status = "stopped"
                 runtime.stop_reason = "stream_open_failed"
                 runtime.source_opened = False
+                final_count = int(runtime.current_count)
+                runtime.last_debug_frame_jpeg = None
+                runtime.counted_track_ids.clear()
+                runtime.last_side_by_track.clear()
+                runtime.track_point_history.clear()
+                runtime.track_last_seen_frame_by_id.clear()
+                runtime.track_in_line_band_by_id.clear()
+                runtime.track_samples_by_id.clear()
             print(
                 "[traffic-vision-worker] worker round stopped",
                 {
                     "roundId": runtime.spec.round_id,
                     "reason": "stream_open_failed",
-                    "finalCount": runtime.current_count,
+                    "finalCount": final_count,
                 },
+            )
+            print(
+                "[traffic-vision-worker] round runtime memory cleaned",
+                {"roundId": runtime.spec.round_id, "finalCount": final_count},
             )
             return
 
@@ -941,7 +977,13 @@ class TrafficRoundManager:
         )
 
         frame_idx = 0
+        processed_frame_idx = 0
         frame_read_failures = 0
+        last_process_at = 0.0
+        last_debug_frame_store_at = 0.0
+        process_interval = 1.0 / SETTINGS.process_fps
+        debug_frame_interval = 1.0 / SETTINGS.debug_frame_fps
+        max_process_width = int(SETTINGS.max_process_width)
         line_x1 = float(runtime.spec.line["x1"])
         line_y1 = float(runtime.spec.line["y1"])
         line_x2 = float(runtime.spec.line["x2"])
@@ -984,25 +1026,46 @@ class TrafficRoundManager:
 
                 frame_idx += 1
                 with runtime.lock:
-                    runtime.last_frame_at = time.time()
-                    has_debug_frame = runtime.last_debug_frame_jpeg is not None
+                    runtime.last_frame_at = now
 
-                if not has_debug_frame:
-                    raw_ok, raw_encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                frame_height, frame_width = frame.shape[:2]
+                processed_frame = frame
+                if (
+                    frame_width > 0
+                    and max_process_width > 0
+                    and frame_width > max_process_width
+                ):
+                    scale = float(max_process_width) / float(frame_width)
+                    resized_height = max(1, int(round(float(frame_height) * scale)))
+                    processed_frame = cv2.resize(
+                        frame,
+                        (int(max_process_width), int(resized_height)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    frame_height, frame_width = processed_frame.shape[:2]
+
+                now = time.time()
+                should_process = (now - last_process_at) >= process_interval
+                should_store_debug = (now - last_debug_frame_store_at) >= debug_frame_interval
+                raw_ok = False
+                raw_bytes = b""
+                if not should_process and not should_store_debug:
+                    time.sleep(0.005)
+                    continue
+
+                if should_store_debug:
+                    raw_ok, raw_encoded = cv2.imencode(
+                        ".jpg",
+                        processed_frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+                    )
                     if raw_ok:
                         raw_bytes = raw_encoded.tobytes()
                         with runtime.lock:
-                            if runtime.last_debug_frame_jpeg is None:
-                                runtime.last_debug_frame_jpeg = raw_bytes
-                                print(
-                                    "[traffic-vision-worker] raw frame stored",
-                                    {
-                                        "roundId": runtime.spec.round_id,
-                                        "bytes": len(raw_bytes),
-                                    },
-                                )
+                            runtime.last_debug_frame_jpeg = raw_bytes
+                            runtime.last_frame_at = now
+                        last_debug_frame_store_at = now
 
-                frame_height, frame_width = frame.shape[:2]
                 if frame_width > 0 and frame_height > 0:
                     if source_type == "remote_stream":
                         line_x1 = float(
@@ -1107,23 +1170,56 @@ class TrafficRoundManager:
                         )
                         line_metrics_logged = True
 
-                if frame_idx <= 3 or (
-                    SETTINGS.frame_log_interval > 0 and frame_idx % SETTINGS.frame_log_interval == 0
+                if not should_process:
+                    continue
+
+                processed_frame_idx += 1
+                last_process_at = now
+                should_log_tick = processed_frame_idx <= 3 or (
+                    SETTINGS.frame_log_interval > 0
+                    and processed_frame_idx % SETTINGS.frame_log_interval == 0
+                )
+                if should_log_tick:
+                    print(
+                        "[traffic-vision-worker] frame loop tick",
+                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
+                    )
+                    if should_store_debug and raw_ok:
+                        print(
+                            "[traffic-vision-worker] raw live frame stored",
+                            {
+                                "roundId": runtime.spec.round_id,
+                                "frame": processed_frame_idx,
+                                "bytes": len(raw_bytes),
+                            },
+                        )
+
+                if processed_frame_idx <= 3 or (
+                    SETTINGS.frame_log_interval > 0
+                    and processed_frame_idx % SETTINGS.frame_log_interval == 0
                 ):
                     print(
                         "[traffic-vision-worker] frame read success",
-                        {"roundId": runtime.spec.round_id, "frame": frame_idx},
+                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
 
-                if SETTINGS.frame_log_interval > 0 and frame_idx % SETTINGS.frame_log_interval == 0:
+                if (
+                    SETTINGS.frame_log_interval > 0
+                    and processed_frame_idx % SETTINGS.frame_log_interval == 0
+                ):
                     print(
                         "[traffic-vision-worker] frame processing active",
-                        {"roundId": runtime.spec.round_id, "frame": frame_idx},
+                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
 
+                if should_log_tick:
+                    print(
+                        "[traffic-vision-worker] model.track start",
+                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
+                    )
                 try:
                     results = model.track(
-                        frame,
+                        processed_frame,
                         persist=True,
                         tracker=tracker_cfg,
                         classes=runtime.spec.class_ids,
@@ -1136,18 +1232,40 @@ class TrafficRoundManager:
                         "[traffic-vision-worker] frame processing error",
                         {
                             "roundId": runtime.spec.round_id,
-                            "frame": frame_idx,
+                            "frame": processed_frame_idx,
                             "error": str(track_error),
                         },
                     )
-                    self._update_debug_frame(runtime, frame, [], line_x1, line_y1, line_x2, line_y2)
+                    self._update_debug_frame(
+                        runtime,
+                        processed_frame,
+                        [],
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                    )
                     time.sleep(0.01)
                     continue
+
+                if should_log_tick:
+                    print(
+                        "[traffic-vision-worker] model.track done",
+                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
+                    )
 
                 if not results:
                     with runtime.lock:
                         runtime.detections_last_frame = 0
-                    self._update_debug_frame(runtime, frame, [], line_x1, line_y1, line_x2, line_y2)
+                    self._update_debug_frame(
+                        runtime,
+                        processed_frame,
+                        [],
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                    )
                     continue
 
                 first = results[0]
@@ -1155,12 +1273,28 @@ class TrafficRoundManager:
                 if boxes is None:
                     with runtime.lock:
                         runtime.detections_last_frame = 0
-                    self._update_debug_frame(runtime, frame, [], line_x1, line_y1, line_x2, line_y2)
+                    self._update_debug_frame(
+                        runtime,
+                        processed_frame,
+                        [],
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                    )
                     continue
                 if boxes.id is None or boxes.cls is None or boxes.xyxy is None:
                     with runtime.lock:
                         runtime.detections_last_frame = 0
-                    self._update_debug_frame(runtime, frame, [], line_x1, line_y1, line_x2, line_y2)
+                    self._update_debug_frame(
+                        runtime,
+                        processed_frame,
+                        [],
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                    )
                     continue
 
                 track_ids = boxes.id.int().cpu().tolist()
@@ -1170,14 +1304,23 @@ class TrafficRoundManager:
                 with runtime.lock:
                     runtime.detections_last_frame = detections_len
 
-                if detections_len > 0 or (
-                    SETTINGS.frame_log_interval > 0 and frame_idx % SETTINGS.frame_log_interval == 0
-                ):
+                if should_log_tick:
+                    print(
+                        "[traffic-vision-worker] detections parsed",
+                        {
+                            "roundId": runtime.spec.round_id,
+                            "frame": processed_frame_idx,
+                            "detections": detections_len,
+                            "tracks": len(track_ids),
+                        },
+                    )
+
+                if detections_len > 0 or should_log_tick:
                     print(
                         "[traffic-vision-worker] detections count per frame",
                         {
                             "roundId": runtime.spec.round_id,
-                            "frame": frame_idx,
+                            "frame": processed_frame_idx,
                             "detections": detections_len,
                         },
                     )
@@ -1212,7 +1355,7 @@ class TrafficRoundManager:
                         remote_min_motion_px,
                         remote_min_bbox_area_px,
                         remote_line_margin_px,
-                        frame_idx,
+                        processed_frame_idx,
                     )
                     debug_detections.append(
                         {
@@ -1226,10 +1369,38 @@ class TrafficRoundManager:
                         }
                     )
 
-                if frame_idx % 30 == 0:
-                    self._cleanup_stale_tracks(runtime, frame_idx)
+                with runtime.lock:
+                    current_count = int(runtime.current_count)
 
-                if DEBUG_CROSSING and frame_idx % 30 == 0 and detections_len > 0:
+                if should_log_tick:
+                    print(
+                        "[traffic-vision-worker] counting complete",
+                        {
+                            "roundId": runtime.spec.round_id,
+                            "frame": processed_frame_idx,
+                            "detections": detections_len,
+                            "tracks": len(track_ids),
+                            "currentCount": current_count,
+                        },
+                    )
+
+                if processed_frame_idx % 30 == 0:
+                    self._cleanup_stale_tracks(runtime, processed_frame_idx)
+                    if resource is not None:
+                        try:
+                            usage = resource.getrusage(resource.RUSAGE_SELF)
+                            print(
+                                "[traffic-vision-worker] memory usage",
+                                {
+                                    "roundId": runtime.spec.round_id,
+                                    "frame": processed_frame_idx,
+                                    "ruMaxRss": int(getattr(usage, "ru_maxrss", 0)),
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                if DEBUG_CROSSING and processed_frame_idx % 30 == 0 and detections_len > 0:
                     with runtime.lock:
                         use_y_axis = runtime.counting_line_y is not None and runtime.counting_line_x is None
                         dbg_parts = []
@@ -1247,13 +1418,13 @@ class TrafficRoundManager:
                         l_axis = runtime.counting_line_y if use_y_axis else runtime.counting_line_x
                         cc = runtime.current_count
                     print(
-                        f"[CROSSING_DEBUG] f={frame_idx} l={l_axis or 0} cnt={cc} det={detections_len} "
+                        f"[CROSSING_DEBUG] f={processed_frame_idx} l={l_axis or 0} cnt={cc} det={detections_len} "
                         + " | ".join(dbg_parts[:8])
                     )
 
                 self._update_debug_frame(
                     runtime,
-                    frame,
+                    processed_frame,
                     debug_detections,
                     line_x1,
                     line_y1,
@@ -1268,6 +1439,13 @@ class TrafficRoundManager:
                 if runtime.stop_reason is None:
                     runtime.stop_reason = "manual_stop" if runtime.stop_event.is_set() else "end_time_reached"
                 final_count = int(runtime.current_count)
+                runtime.last_debug_frame_jpeg = None
+                runtime.counted_track_ids.clear()
+                runtime.last_side_by_track.clear()
+                runtime.track_point_history.clear()
+                runtime.track_last_seen_frame_by_id.clear()
+                runtime.track_in_line_band_by_id.clear()
+                runtime.track_samples_by_id.clear()
 
             print(
                 "[traffic-vision-worker] worker round stopped",
@@ -1279,6 +1457,10 @@ class TrafficRoundManager:
             )
             print(
                 "[traffic-vision-worker] final frozen count returned",
+                {"roundId": runtime.spec.round_id, "finalCount": final_count},
+            )
+            print(
+                "[traffic-vision-worker] round runtime memory cleaned",
                 {"roundId": runtime.spec.round_id, "finalCount": final_count},
             )
 
