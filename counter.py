@@ -337,6 +337,7 @@ class RoundRuntime:
     last_track_samples: Optional[int] = None
     last_reject_reason: Optional[str] = None
     last_debug_frame_jpeg: Optional[bytes] = None
+    last_debug_frame_log_at: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> Dict[str, object]:
@@ -962,13 +963,19 @@ class TrafficRoundManager:
 
         with runtime.lock:
             runtime.last_debug_frame_jpeg = encoded.tobytes()
-            print(
-                "[traffic-vision-worker] debug frame stored",
-                {
-                    "roundId": runtime.spec.round_id,
-                    "bytes": len(runtime.last_debug_frame_jpeg),
-                },
-            )
+            now = time.time()
+            should_log = False
+            if runtime.last_debug_frame_log_at is None or (now - runtime.last_debug_frame_log_at) >= 5.0:
+                should_log = True
+                runtime.last_debug_frame_log_at = now
+            if should_log:
+                print(
+                    "[traffic-vision-worker] debug frame stored",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "bytes": len(runtime.last_debug_frame_jpeg),
+                    },
+                )
 
     def _run_round(self, runtime: RoundRuntime) -> None:
         model = self._get_model()
