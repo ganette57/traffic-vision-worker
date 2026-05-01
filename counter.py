@@ -393,8 +393,10 @@ class TrafficRoundManager:
             {"useTracking": SETTINGS.use_tracking, "modelName": SETTINGS.model_name},
         )
 
-    def _get_model(self) -> YOLO:
+    def _get_model(self) -> Optional[YOLO]:
         with self._model_lock:
+            if SETTINGS.disable_inference:
+                return None
             if self._model is None:
                 self._model = YOLO(SETTINGS.model_name)
             return self._model
@@ -1149,6 +1151,11 @@ class TrafficRoundManager:
                 "source": active_source,
             },
         )
+        if SETTINGS.disable_inference:
+            print(
+                "[traffic-vision-worker] inference disabled (live-only mode)",
+                {"roundId": runtime.spec.round_id},
+            )
 
         frame_idx = 0
         processed_frame_idx = 0
@@ -1225,6 +1232,9 @@ class TrafficRoundManager:
                 now = time.time()
                 should_process = (now - last_process_at) >= process_interval
                 should_store_debug = (now - last_debug_frame_store_at) >= debug_frame_interval
+                if SETTINGS.disable_inference:
+                    should_process = True
+                    should_store_debug = True
                 raw_ok = False
                 raw_bytes = b""
                 if not should_process and not should_store_debug:
@@ -1390,82 +1400,85 @@ class TrafficRoundManager:
                         {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                     )
 
-                if should_log_tick:
-                    print(
-                        "[traffic-vision-worker] model.track start"
-                        if use_tracking
-                        else "[traffic-vision-worker] model.predict start",
-                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
-                    )
-                inference_started_at = time.time()
-                try:
-                    if use_tracking:
-                        results = model.track(
-                            processed_frame,
-                            persist=True,
-                            tracker=tracker_cfg,
-                            classes=runtime.spec.class_ids,
-                            conf=SETTINGS.conf_threshold,
-                            iou=SETTINGS.iou_threshold,
-                            verbose=False,
+                inference_elapsed = 0.0
+                if SETTINGS.disable_inference:
+                    results = []
+                else:
+                    if should_log_tick:
+                        print(
+                            "[traffic-vision-worker] model.track start"
+                            if use_tracking
+                            else "[traffic-vision-worker] model.predict start",
+                            {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
                         )
-                    else:
-                        results = model.predict(
-                            processed_frame,
-                            classes=runtime.spec.class_ids,
-                            conf=SETTINGS.conf_threshold,
-                            iou=SETTINGS.iou_threshold,
-                            verbose=False,
+                    inference_started_at = time.time()
+                    try:
+                        if use_tracking:
+                            results = model.track(
+                                processed_frame,
+                                persist=True,
+                                tracker=tracker_cfg,
+                                classes=runtime.spec.class_ids,
+                                conf=SETTINGS.conf_threshold,
+                                iou=SETTINGS.iou_threshold,
+                                verbose=False,
+                            )
+                        else:
+                            results = model.predict(
+                                processed_frame,
+                                classes=runtime.spec.class_ids,
+                                conf=SETTINGS.conf_threshold,
+                                iou=SETTINGS.iou_threshold,
+                                verbose=False,
+                            )
+                    except Exception as track_error:
+                        print(
+                            "[traffic-vision-worker] frame processing error",
+                            {
+                                "roundId": runtime.spec.round_id,
+                                "frame": processed_frame_idx,
+                                "error": str(track_error),
+                            },
                         )
-                except Exception as track_error:
+                        self._update_debug_frame(
+                            runtime,
+                            processed_frame,
+                            [],
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                        )
+                        time.sleep(0.01)
+                        continue
+                    inference_elapsed = time.time() - inference_started_at
                     print(
-                        "[traffic-vision-worker] frame processing error",
+                        "[traffic-vision-worker] model inference done",
                         {
                             "roundId": runtime.spec.round_id,
                             "frame": processed_frame_idx,
-                            "error": str(track_error),
-                        },
-                    )
-                    self._update_debug_frame(
-                        runtime,
-                        processed_frame,
-                        [],
-                        line_x1,
-                        line_y1,
-                        line_x2,
-                        line_y2,
-                    )
-                    time.sleep(0.01)
-                    continue
-
-                inference_elapsed = time.time() - inference_started_at
-                print(
-                    "[traffic-vision-worker] model inference done",
-                    {
-                        "roundId": runtime.spec.round_id,
-                        "frame": processed_frame_idx,
-                        "useTracking": use_tracking,
-                        "elapsedMs": int(inference_elapsed * 1000.0),
-                    },
-                )
-                if should_log_tick:
-                    print(
-                        "[traffic-vision-worker] model.track done"
-                        if use_tracking
-                        else "[traffic-vision-worker] model.predict done",
-                        {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
-                    )
-                if inference_elapsed > inference_slow_sec:
-                    print(
-                        "[traffic-vision-worker] inference too slow, skipping post-processing",
-                        {
-                            "roundId": runtime.spec.round_id,
-                            "frame": processed_frame_idx,
+                            "useTracking": use_tracking,
                             "elapsedMs": int(inference_elapsed * 1000.0),
-                            "thresholdMs": int(inference_slow_sec * 1000.0),
                         },
                     )
-                    continue
+                    if should_log_tick:
+                        print(
+                            "[traffic-vision-worker] model.track done"
+                            if use_tracking
+                            else "[traffic-vision-worker] model.predict done",
+                            {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
+                        )
+                    if inference_elapsed > inference_slow_sec:
+                        print(
+                            "[traffic-vision-worker] inference too slow, skipping post-processing",
+                            {
+                                "roundId": runtime.spec.round_id,
+                                "frame": processed_frame_idx,
+                                "elapsedMs": int(inference_elapsed * 1000.0),
+                                "thresholdMs": int(inference_slow_sec * 1000.0),
+                            },
+                        )
+                        continue
 
                 if not results:
                     with runtime.lock:

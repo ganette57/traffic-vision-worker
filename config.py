@@ -13,6 +13,7 @@ class WorkerSettings:
     debug_video_file: str = os.getenv("TRAFFIC_VISION_DEBUG_VIDEO_FILE", "/tmp/traffic_sample.mp4")
     debug_use_local_file: bool = os.getenv("TRAFFIC_VISION_DEBUG_USE_LOCAL_FILE", "0") == "1"
     allow_concurrent_rounds: bool = os.getenv("TRAFFIC_ALLOW_CONCURRENT_ROUNDS", "0") == "1"
+    disable_inference: bool = os.getenv("TRAFFIC_DISABLE_INFERENCE", "0") == "1"
     use_tracking: bool = os.getenv("TRAFFIC_USE_TRACKING", "0") == "1"
     simple_line_touch_count: bool = os.getenv("TRAFFIC_SIMPLE_LINE_TOUCH_COUNT", "1") == "1"
     simple_count_cooldown_frames: int = max(
