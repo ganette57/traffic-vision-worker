@@ -1816,8 +1816,25 @@ class TrafficRoundManager:
                     continue
 
                 frame_idx += 1
+                raw_frame_bytes: Optional[bytes] = None
+                ok_raw, encoded_raw = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                )
+                if ok_raw:
+                    raw_frame_bytes = encoded_raw.tobytes()
                 with runtime.lock:
                     runtime.last_frame_at = now
+                    if raw_frame_bytes is not None:
+                        runtime.last_debug_frame_jpeg = raw_frame_bytes
+                if raw_frame_bytes is not None and frame_idx <= 3:
+                    print(
+                        "[traffic-vision-worker] raw live frame stored",
+                        {
+                            "roundId": runtime.spec.round_id,
+                            "frame": int(frame_idx),
+                            "bytes": len(raw_frame_bytes),
+                        },
+                    )
 
                 frame_height, frame_width = frame.shape[:2]
                 processed_frame = frame
@@ -1951,6 +1968,27 @@ class TrafficRoundManager:
                             },
                         )
                         line_metrics_logged = True
+
+                    self._update_debug_frame(
+                        runtime,
+                        processed_frame,
+                        [],
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                    )
+                    if frame_idx <= 3:
+                        with runtime.lock:
+                            bytes_present = runtime.last_debug_frame_jpeg is not None
+                        print(
+                            "[traffic-vision-worker] raw debug frame stored before inference",
+                            {
+                                "roundId": runtime.spec.round_id,
+                                "frame": int(frame_idx),
+                                "bytesPresent": bool(bytes_present),
+                            },
+                        )
 
                 if not should_process:
                     if should_store_debug:
