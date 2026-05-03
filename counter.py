@@ -1969,10 +1969,12 @@ class TrafficRoundManager:
                         )
                         line_metrics_logged = True
 
+                    with runtime.lock:
+                        pre_inference_debug_detections = list(runtime.latest_async_debug_detections)
                     self._update_debug_frame(
                         runtime,
                         processed_frame,
-                        [],
+                        pre_inference_debug_detections,
                         line_x1,
                         line_y1,
                         line_x2,
