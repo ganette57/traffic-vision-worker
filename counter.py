@@ -900,9 +900,15 @@ class TrafficRoundManager:
             x_min, y_min, x_max, y_max = bbox
             side = int(det.get("side", 0))
             in_roi = bool(det.get("in_roi", True))
+            counted = bool(det.get("counted", False))
+            cooldown = bool(det.get("cooldown", False))
 
             color = (40, 190, 255)
-            if side > 0:
+            if counted:
+                color = (40, 220, 80)
+            elif cooldown:
+                color = (0, 170, 255)
+            elif side > 0:
                 color = (40, 220, 80)
             elif side < 0:
                 color = (80, 160, 255)
@@ -1191,8 +1197,9 @@ class TrafficRoundManager:
         accepted = 0
         rejected = 0
         reject_logs = 0
-        max_reject_logs = 4
+        max_reject_logs = 3
         debug_detections: List[Dict[str, object]] = []
+        line_margin_px = float(SETTINGS.motion_line_margin_px)
 
         with runtime.lock:
             expired = [
@@ -1262,20 +1269,14 @@ class TrafficRoundManager:
             if aspect < min_aspect or aspect > max_aspect:
                 reject_blob("aspect_out_of_range", x, y, w, h, area, center_x, center_y)
                 continue
-            fill_ratio = area / float(max(1, w * h))
-            if fill_ratio < 0.10:
-                reject_blob("tiny_flicker", x, y, w, h, area, center_x, center_y)
+
+            touches_line_zone = (int(y) <= int(line_y + line_margin_px)) and (
+                int(y + h) >= int(line_y - line_margin_px)
+            )
+            if not touches_line_zone:
                 continue
 
-            touches_line = int(y) <= int(line_y) <= int(y + h)
-            if not touches_line:
-                reject_blob("bbox_does_not_cross_line", x, y, w, h, area, center_x, center_y)
-                continue
-
-            in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
-            if not in_roi:
-                reject_blob("outside_roi", x, y, w, h, area, center_x, center_y)
-                continue
+            in_roi = True
             if roi_x1 is not None and center_x < float(roi_x1):
                 reject_blob("center_x_left_of_roi", x, y, w, h, area, center_x, center_y)
                 continue
@@ -1290,7 +1291,7 @@ class TrafficRoundManager:
                 line_y1,
                 line_x2,
                 line_y2,
-                float(SETTINGS.motion_line_margin_px),
+                line_margin_px,
             )
             print(
                 "[Traffic][MOTION_TOUCH]",
@@ -1304,22 +1305,11 @@ class TrafficRoundManager:
                     "bbox": [int(x), int(y), int(w), int(h)],
                 },
             )
-            debug_detections.append(
-                {
-                    "track_id": int(center_x),
-                    "class_id": 2,
-                    "bbox": (float(x), float(y), float(x + w), float(y + h)),
-                    "point_x": int(center_x),
-                    "point_y": int(center_y),
-                    "side": int(side),
-                    "in_roi": bool(in_roi),
-                }
-            )
-            bucket_key = str(int(center_x // 70.0))
+            bucket_key = str(int(center_x // 60))
             counted = False
             with runtime.lock:
                 last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
-                if last_seen is None or (int(frame_idx) - int(last_seen)) > cooldown:
+                if last_seen is None or (int(frame_idx) - int(last_seen)) >= cooldown:
                     runtime.motion_counted_buckets_last_frame[bucket_key] = int(frame_idx)
                     runtime.current_count += 1
                     runtime.last_counted_track_id = int(center_x)
@@ -1340,7 +1330,33 @@ class TrafficRoundManager:
 
             if counted:
                 accepted += 1
+                debug_detections.append(
+                    {
+                        "track_id": int(center_x),
+                        "class_id": 2,
+                        "bbox": (float(x), float(y), float(x + w), float(y + h)),
+                        "point_x": int(center_x),
+                        "point_y": int(center_y),
+                        "side": int(side),
+                        "in_roi": bool(in_roi),
+                        "counted": True,
+                        "cooldown": False,
+                    }
+                )
             else:
+                debug_detections.append(
+                    {
+                        "track_id": int(center_x),
+                        "class_id": 2,
+                        "bbox": (float(x), float(y), float(x + w), float(y + h)),
+                        "point_x": int(center_x),
+                        "point_y": int(center_y),
+                        "side": int(side),
+                        "in_roi": bool(in_roi),
+                        "counted": False,
+                        "cooldown": True,
+                    }
+                )
                 reject_blob("cooldown_active", x, y, w, h, area, center_x, center_y)
 
         print(
