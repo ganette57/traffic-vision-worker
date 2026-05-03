@@ -2056,8 +2056,9 @@ class TrafficRoundManager:
                     )
 
                 if use_yolo_simple:
-                    if (now - last_yolo_inference_at) >= inference_interval:
-                        last_yolo_inference_at = now
+                    now_yolo = time.time()
+                    if (now_yolo - last_yolo_inference_at) >= inference_interval:
+                        last_yolo_inference_at = now_yolo
                         if should_log_tick:
                             print(
                                 "[traffic-vision-worker] yolo simple inference",
@@ -2071,6 +2072,17 @@ class TrafficRoundManager:
                             model,
                             processed_frame,
                             processed_frame_idx,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
+                        )
+                        with runtime.lock:
+                            post_inference_debug_detections = list(runtime.latest_async_debug_detections)
+                        self._update_debug_frame(
+                            runtime,
+                            processed_frame,
+                            post_inference_debug_detections,
                             line_x1,
                             line_y1,
                             line_x2,
