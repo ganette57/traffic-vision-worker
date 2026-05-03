@@ -1137,6 +1137,21 @@ class TrafficRoundManager:
     ) -> None:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        frame_height = int(gray.shape[0])
+        line_y = int(round((float(line_y1) + float(line_y2)) / 2.0))
+        line_y = _clamp_int(line_y, 0, max(0, frame_height - 1))
+        band_height = int(SETTINGS.motion_band_height_px)
+        roi_top = int(roi_y1) if roi_y1 is not None else 0
+        roi_bottom = int(roi_y2) if roi_y2 is not None else max(0, frame_height - 1)
+        roi_top = _clamp_int(roi_top, 0, max(0, frame_height - 1))
+        roi_bottom = _clamp_int(roi_bottom, 0, max(0, frame_height - 1))
+        if roi_bottom < roi_top:
+            roi_top, roi_bottom = roi_bottom, roi_top
+        band_top = max(roi_top, line_y - band_height)
+        band_bottom = min(roi_bottom, line_y + band_height)
+        if band_bottom <= band_top:
+            band_bottom = min(max(0, frame_height - 1), band_top + 1)
+
         with runtime.lock:
             previous_gray = runtime.previous_gray_frame
             runtime.previous_gray_frame = gray
@@ -1146,14 +1161,37 @@ class TrafficRoundManager:
                 runtime.detections_last_frame = 0
             return
 
-        delta = cv2.absdiff(previous_gray, gray)
+        if previous_gray.shape != gray.shape:
+            with runtime.lock:
+                runtime.latest_motion_debug_detections = []
+                runtime.detections_last_frame = 0
+            return
+
+        previous_band = previous_gray[band_top : band_bottom + 1, :]
+        current_band = gray[band_top : band_bottom + 1, :]
+        if previous_band.size == 0 or current_band.size == 0:
+            with runtime.lock:
+                runtime.latest_motion_debug_detections = []
+                runtime.detections_last_frame = 0
+            return
+
+        delta = cv2.absdiff(previous_band, current_band)
         thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
         thresh = cv2.dilate(thresh, None, iterations=2)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        line_y = int(round((float(line_y1) + float(line_y2)) / 2.0))
         min_area = float(SETTINGS.motion_min_area)
+        max_area = float(SETTINGS.motion_max_area)
+        min_width = int(SETTINGS.motion_min_width)
+        min_height = int(SETTINGS.motion_min_height)
+        max_height = int(SETTINGS.motion_max_height)
+        min_aspect = float(SETTINGS.motion_min_aspect)
+        max_aspect = float(SETTINGS.motion_max_aspect)
         cooldown = int(SETTINGS.motion_cooldown_frames)
-        blobs = 0
+        raw_contours = len(contours)
+        accepted = 0
+        rejected = 0
+        reject_logs = 0
+        max_reject_logs = 4
         debug_detections: List[Dict[str, object]] = []
 
         with runtime.lock:
@@ -1165,15 +1203,86 @@ class TrafficRoundManager:
             for key in expired:
                 runtime.motion_counted_buckets_last_frame.pop(key, None)
 
+        def reject_blob(
+            reason: str,
+            x: int,
+            y: int,
+            w: int,
+            h: int,
+            area: float,
+            center_x: float,
+            center_y: float,
+        ) -> None:
+            nonlocal rejected, reject_logs
+            rejected += 1
+            if reject_logs >= max_reject_logs:
+                return
+            reject_logs += 1
+            print(
+                "[Traffic][MOTION_REJECT]",
+                {
+                    "roundId": runtime.spec.round_id,
+                    "frame": int(frame_idx),
+                    "reason": reason,
+                    "x": int(x),
+                    "y": int(y),
+                    "w": int(w),
+                    "h": int(h),
+                    "area": float(area),
+                    "centerX": int(center_x),
+                    "centerY": int(center_y),
+                    "lineY": int(line_y),
+                },
+            )
+
         for contour in contours:
             area = float(cv2.contourArea(contour))
-            if area < min_area:
-                continue
-            blobs += 1
-            x, y, w, h = cv2.boundingRect(contour)
+            x_band, y_band, w, h = cv2.boundingRect(contour)
+            x = int(x_band)
+            y = int(y_band + band_top)
             center_x = float(x) + (float(w) / 2.0)
             center_y = float(y) + (float(h) / 2.0)
+
+            if area < min_area:
+                reject_blob("area_too_small", x, y, w, h, area, center_x, center_y)
+                continue
+            if area > max_area:
+                reject_blob("area_too_large", x, y, w, h, area, center_x, center_y)
+                continue
+            if w < min_width:
+                reject_blob("width_too_small", x, y, w, h, area, center_x, center_y)
+                continue
+            if h < min_height:
+                reject_blob("height_too_small", x, y, w, h, area, center_x, center_y)
+                continue
+            if h > max_height:
+                reject_blob("height_too_large", x, y, w, h, area, center_x, center_y)
+                continue
+            aspect = float(w) / float(max(1, h))
+            if aspect < min_aspect or aspect > max_aspect:
+                reject_blob("aspect_out_of_range", x, y, w, h, area, center_x, center_y)
+                continue
+            fill_ratio = area / float(max(1, w * h))
+            if fill_ratio < 0.10:
+                reject_blob("tiny_flicker", x, y, w, h, area, center_x, center_y)
+                continue
+
+            touches_line = int(y) <= int(line_y) <= int(y + h)
+            if not touches_line:
+                reject_blob("bbox_does_not_cross_line", x, y, w, h, area, center_x, center_y)
+                continue
+
             in_roi = self._is_track_in_roi(center_x, center_y, roi_x1, roi_y1, roi_x2, roi_y2)
+            if not in_roi:
+                reject_blob("outside_roi", x, y, w, h, area, center_x, center_y)
+                continue
+            if roi_x1 is not None and center_x < float(roi_x1):
+                reject_blob("center_x_left_of_roi", x, y, w, h, area, center_x, center_y)
+                continue
+            if roi_x2 is not None and center_x > float(roi_x2):
+                reject_blob("center_x_right_of_roi", x, y, w, h, area, center_x, center_y)
+                continue
+
             side = self._get_effective_side(
                 center_x,
                 center_y,
@@ -1183,60 +1292,18 @@ class TrafficRoundManager:
                 line_y2,
                 float(SETTINGS.motion_line_margin_px),
             )
-            touches_line = float(y) <= float(line_y) <= float(y + h)
-            if not in_roi:
-                print(
-                    "[Traffic][MOTION_REJECT]",
-                    {
-                        "roundId": runtime.spec.round_id,
-                        "frame": int(frame_idx),
-                        "centerX": int(center_x),
-                        "centerY": int(center_y),
-                        "lineY": int(line_y),
-                        "area": area,
-                        "reason": "outside_roi",
-                    },
-                )
-            elif not touches_line:
-                print(
-                    "[Traffic][MOTION_REJECT]",
-                    {
-                        "roundId": runtime.spec.round_id,
-                        "frame": int(frame_idx),
-                        "centerX": int(center_x),
-                        "centerY": int(center_y),
-                        "lineY": int(line_y),
-                        "area": area,
-                        "reason": "bbox_does_not_cross_line",
-                    },
-                )
-            if in_roi and touches_line:
-                print(
-                    "[Traffic][MOTION_TOUCH]",
-                    {
-                        "roundId": runtime.spec.round_id,
-                        "frame": int(frame_idx),
-                        "centerX": int(center_x),
-                        "centerY": int(center_y),
-                        "lineY": int(line_y),
-                        "area": area,
-                    },
-                )
-                bucket_key = str(int(center_x // 80.0))
-                with runtime.lock:
-                    last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
-                    if last_seen is None or (int(frame_idx) - int(last_seen)) > cooldown:
-                        runtime.motion_counted_buckets_last_frame[bucket_key] = int(frame_idx)
-                        runtime.current_count += 1
-                        runtime.last_counted_track_id = int(center_x)
-                        runtime.last_crossing_direction = "motion_line_touch"
-                        runtime.last_reject_reason = None
-                        current_count = int(runtime.current_count)
-                        print(
-                            "[Traffic][COUNT_PLUS_ONE]",
-                            {"roundId": runtime.spec.round_id, "currentCount": current_count},
-                        )
-
+            print(
+                "[Traffic][MOTION_TOUCH]",
+                {
+                    "roundId": runtime.spec.round_id,
+                    "frame": int(frame_idx),
+                    "centerX": int(center_x),
+                    "centerY": int(center_y),
+                    "lineY": int(line_y),
+                    "area": area,
+                    "bbox": [int(x), int(y), int(w), int(h)],
+                },
+            )
             debug_detections.append(
                 {
                     "track_id": int(center_x),
@@ -1248,14 +1315,47 @@ class TrafficRoundManager:
                     "in_roi": bool(in_roi),
                 }
             )
+            bucket_key = str(int(center_x // 70.0))
+            counted = False
+            with runtime.lock:
+                last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
+                if last_seen is None or (int(frame_idx) - int(last_seen)) > cooldown:
+                    runtime.motion_counted_buckets_last_frame[bucket_key] = int(frame_idx)
+                    runtime.current_count += 1
+                    runtime.last_counted_track_id = int(center_x)
+                    runtime.last_crossing_direction = "motion_line_touch"
+                    runtime.last_reject_reason = None
+                    current_count = int(runtime.current_count)
+                    counted = True
+                    print(
+                        "[Traffic][COUNT_PLUS_ONE]",
+                        {
+                            "roundId": runtime.spec.round_id,
+                            "frame": int(frame_idx),
+                            "centerX": int(center_x),
+                            "bucket": bucket_key,
+                            "currentCount": current_count,
+                        },
+                    )
+
+            if counted:
+                accepted += 1
+            else:
+                reject_blob("cooldown_active", x, y, w, h, area, center_x, center_y)
 
         print(
             "[Traffic][MOTION_BLOBS]",
-            {"roundId": runtime.spec.round_id, "frame": int(frame_idx), "blobs": int(blobs)},
+            {
+                "roundId": runtime.spec.round_id,
+                "frame": int(frame_idx),
+                "rawContours": int(raw_contours),
+                "accepted": int(accepted),
+                "rejected": int(rejected),
+            },
         )
         with runtime.lock:
             runtime.latest_motion_debug_detections = debug_detections
-            runtime.detections_last_frame = int(blobs)
+            runtime.detections_last_frame = int(accepted)
 
     def _run_round(self, runtime: RoundRuntime) -> None:
         model: Optional[YOLO] = None
@@ -1329,7 +1429,6 @@ class TrafficRoundManager:
                     runtime.stop_reason = "unsupported_camera"
                     runtime.source_opened = False
                     final_count = int(runtime.current_count)
-                    runtime.last_debug_frame_jpeg = None
                     runtime.counted_track_ids.clear()
                     runtime.last_side_by_track.clear()
                     runtime.track_point_history.clear()
@@ -1415,7 +1514,6 @@ class TrafficRoundManager:
                 runtime.stop_reason = "stream_open_failed"
                 runtime.source_opened = False
                 final_count = int(runtime.current_count)
-                runtime.last_debug_frame_jpeg = None
                 runtime.counted_track_ids.clear()
                 runtime.last_side_by_track.clear()
                 runtime.track_point_history.clear()
@@ -1799,7 +1897,6 @@ class TrafficRoundManager:
                 if runtime.stop_reason is None:
                     runtime.stop_reason = "manual_stop" if runtime.stop_event.is_set() else "end_time_reached"
                 final_count = int(runtime.current_count)
-                runtime.last_debug_frame_jpeg = None
                 runtime.counted_track_ids.clear()
                 runtime.last_side_by_track.clear()
                 runtime.track_point_history.clear()

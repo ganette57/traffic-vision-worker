@@ -17,9 +17,16 @@ class WorkerSettings:
     allow_concurrent_rounds: bool = os.getenv("TRAFFIC_ALLOW_CONCURRENT_ROUNDS", "0") == "1"
     disable_inference: bool = os.getenv("TRAFFIC_DISABLE_INFERENCE", "0") == "1"
     motion_line_count: bool = os.getenv("TRAFFIC_MOTION_LINE_COUNT", "1") == "1"
-    motion_min_area: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_MIN_AREA", "1800")))
-    motion_line_margin_px: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_LINE_MARGIN_PX", "10")))
-    motion_cooldown_frames: int = max(1, int(os.getenv("TRAFFIC_MOTION_COOLDOWN_FRAMES", "90")))
+    motion_min_area: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_MIN_AREA", "350")))
+    motion_max_area: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_MAX_AREA", "60000")))
+    motion_line_margin_px: float = max(1.0, float(os.getenv("TRAFFIC_MOTION_LINE_MARGIN_PX", "45")))
+    motion_cooldown_frames: int = max(1, int(os.getenv("TRAFFIC_MOTION_COOLDOWN_FRAMES", "35")))
+    motion_band_height_px: int = max(1, int(os.getenv("TRAFFIC_MOTION_BAND_HEIGHT_PX", "90")))
+    motion_min_width: int = max(1, int(os.getenv("TRAFFIC_MOTION_MIN_WIDTH", "18")))
+    motion_min_height: int = max(1, int(os.getenv("TRAFFIC_MOTION_MIN_HEIGHT", "10")))
+    motion_max_height: int = max(1, int(os.getenv("TRAFFIC_MOTION_MAX_HEIGHT", "180")))
+    motion_min_aspect: float = max(0.01, float(os.getenv("TRAFFIC_MOTION_MIN_ASPECT", "0.4")))
+    motion_max_aspect: float = max(0.01, float(os.getenv("TRAFFIC_MOTION_MAX_ASPECT", "6.0")))
     async_inference: bool = os.getenv("TRAFFIC_ASYNC_INFERENCE", "1") == "1"
     inference_fps: float = max(0.1, float(os.getenv("TRAFFIC_INFERENCE_FPS", "0.5")))
     use_tracking: bool = os.getenv("TRAFFIC_USE_TRACKING", "0") == "1"
