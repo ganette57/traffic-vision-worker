@@ -708,6 +708,69 @@ class TrafficRoundManager:
         print("[Traffic][COUNT_PLUS_ONE]", {"roundId": runtime.spec.round_id, "currentCount": current_count})
         return side, True
 
+    def _count_yolo_line_touch(
+        self,
+        runtime: RoundRuntime,
+        frame_idx: int,
+        track_id: int,
+        cls_id: int,
+        bbox: Tuple[float, float, float, float],
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+    ) -> bool:
+        x_min, y_min, x_max, y_max = bbox
+        is_vertical_line = abs(float(line_x1) - float(line_x2)) <= 1.0 and abs(float(line_y1) - float(line_y2)) > 1.0
+        if is_vertical_line:
+            line_x = (float(line_x1) + float(line_x2)) / 2.0
+            touches = float(x_min) <= line_x <= float(x_max)
+            line_axis_label = "lineX"
+            line_axis_value = int(round(line_x))
+        else:
+            line_y = (float(line_y1) + float(line_y2)) / 2.0
+            touches = float(y_min) <= line_y <= float(y_max)
+            line_axis_label = "lineY"
+            line_axis_value = int(round(line_y))
+
+        if not touches:
+            return False
+
+        current_count: Optional[int] = None
+        with runtime.lock:
+            if runtime.status != "running" or runtime.stop_event.is_set():
+                return False
+            if int(track_id) in runtime.counted_track_ids:
+                return False
+            runtime.counted_track_ids.add(int(track_id))
+            runtime.current_count += 1
+            runtime.last_counted_track_id = int(track_id)
+            runtime.last_crossing_direction = "yolo_line_touch"
+            runtime.last_reject_reason = None
+            current_count = int(runtime.current_count)
+
+        print(
+            "[Traffic][YOLO_LINE_TOUCH]",
+            {
+                "roundId": runtime.spec.round_id,
+                "frame": int(frame_idx),
+                "trackId": int(track_id),
+                "classId": int(cls_id),
+                "bbox": [int(x_min), int(y_min), int(x_max), int(y_max)],
+                line_axis_label: line_axis_value,
+            },
+        )
+        print(
+            "[Traffic][COUNT_PLUS_ONE]",
+            {
+                "roundId": runtime.spec.round_id,
+                "frame": int(frame_idx),
+                "trackId": int(track_id),
+                "currentCount": current_count,
+            },
+        )
+        return True
+
     def _commit_count(
         self,
         runtime: RoundRuntime,
@@ -1373,6 +1436,106 @@ class TrafficRoundManager:
             runtime.latest_motion_debug_detections = debug_detections
             runtime.detections_last_frame = int(accepted)
 
+    def _run_yolo_simple_count(
+        self,
+        runtime: RoundRuntime,
+        model: YOLO,
+        frame,
+        frame_idx: int,
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+    ) -> None:
+        try:
+            results = model.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                classes=runtime.spec.class_ids,
+                imgsz=int(SETTINGS.max_process_width),
+                conf=float(SETTINGS.conf_threshold),
+                iou=float(SETTINGS.iou_threshold),
+                verbose=False,
+            )
+        except Exception as inference_error:
+            print(
+                "[traffic-vision-worker] yolo simple track error",
+                {
+                    "roundId": runtime.spec.round_id,
+                    "frame": int(frame_idx),
+                    "error": str(inference_error),
+                },
+            )
+            return
+
+        debug_detections: List[Dict[str, object]] = []
+        detections_len = 0
+        if results:
+            first = results[0]
+            boxes = getattr(first, "boxes", None)
+            if boxes is not None and boxes.xyxy is not None:
+                xyxy_list = boxes.xyxy.cpu().tolist()
+                cls_list = (
+                    boxes.cls.int().cpu().tolist()
+                    if boxes.cls is not None
+                    else [0] * len(xyxy_list)
+                )
+                if boxes.id is not None:
+                    track_id_list = boxes.id.int().cpu().tolist()
+                else:
+                    track_id_list = [
+                        self._synthetic_track_id(int(c), tuple(map(float, b)))
+                        for c, b in zip(cls_list, xyxy_list)
+                    ]
+                detections_len = len(xyxy_list)
+                for tid_raw, cid_raw, bbox_raw in zip(track_id_list, cls_list, xyxy_list):
+                    track_id = int(tid_raw)
+                    class_id = int(cid_raw)
+                    if class_id not in runtime.spec.class_ids:
+                        continue
+                    x_min = float(bbox_raw[0])
+                    y_min = float(bbox_raw[1])
+                    x_max = float(bbox_raw[2])
+                    y_max = float(bbox_raw[3])
+                    bbox_tuple = (x_min, y_min, x_max, y_max)
+                    counted = self._count_yolo_line_touch(
+                        runtime,
+                        int(frame_idx),
+                        track_id,
+                        class_id,
+                        bbox_tuple,
+                        line_x1,
+                        line_y1,
+                        line_x2,
+                        line_y2,
+                    )
+                    debug_detections.append(
+                        {
+                            "track_id": track_id,
+                            "class_id": class_id,
+                            "bbox": bbox_tuple,
+                            "point_x": int((x_min + x_max) / 2.0),
+                            "point_y": int((y_min + y_max) / 2.0),
+                            "side": 0,
+                            "in_roi": True,
+                            "counted": bool(counted),
+                            "cooldown": False,
+                        }
+                    )
+
+        with runtime.lock:
+            runtime.detections_last_frame = int(detections_len)
+            runtime.latest_async_debug_detections = list(debug_detections)
+        print(
+            "[Traffic][DETECTIONS]",
+            {
+                "roundId": runtime.spec.round_id,
+                "frame": int(frame_idx),
+                "detections": int(detections_len),
+            },
+        )
+
     def _run_round(self, runtime: RoundRuntime) -> None:
         model: Optional[YOLO] = None
         source_candidates: List[str] = []
@@ -1575,40 +1738,28 @@ class TrafficRoundManager:
                 "[traffic-vision-worker] inference disabled (live-only mode)",
                 {"roundId": runtime.spec.round_id},
             )
+        elif SETTINGS.motion_line_count:
+            print(
+                "[traffic-vision-worker] motion line count enabled (opencv-only mode)",
+                {"roundId": runtime.spec.round_id},
+            )
         else:
-            if SETTINGS.motion_line_count:
+            try:
+                model = self._get_model()
+            except Exception as model_error:
+                model = None
                 print(
-                    "[traffic-vision-worker] motion line count enabled (opencv-only mode)",
-                    {"roundId": runtime.spec.round_id},
+                    "[traffic-vision-worker] model load failed, continuing camera-only",
+                    {"roundId": runtime.spec.round_id, "error": str(model_error)},
                 )
-            elif SETTINGS.async_inference:
-                try:
-                    model = self._get_model()
-                except Exception as model_error:
-                    model = None
-                    print(
-                        "[traffic-vision-worker] model load failed, continuing camera-only",
-                        {"roundId": runtime.spec.round_id, "error": str(model_error)},
-                    )
-                if model is not None:
-                    runtime.inference_stop_event.clear()
-                    inference_thread = threading.Thread(
-                        target=self._run_async_inference,
-                        args=(
-                            runtime,
-                            model,
-                            float(SETTINGS.line_margin_px),
-                            int(SETTINGS.simple_count_cooldown_frames),
-                        ),
-                        daemon=True,
-                        name=f"traffic-inference-{runtime.spec.round_id}",
-                    )
-                    runtime.inference_thread = inference_thread
-                    inference_thread.start()
-            else:
+            if model is not None:
                 print(
-                    "[traffic-vision-worker] async inference disabled, camera-only mode",
-                    {"roundId": runtime.spec.round_id},
+                    "[traffic-vision-worker] yolo simple line touch mode enabled",
+                    {
+                        "roundId": runtime.spec.round_id,
+                        "inferenceFps": float(SETTINGS.inference_fps),
+                        "imgsz": int(SETTINGS.max_process_width),
+                    },
                 )
 
         frame_idx = 0
@@ -1629,13 +1780,13 @@ class TrafficRoundManager:
         roi_y2: Optional[int] = None
         line_metrics_logged = False
         use_motion_line_count = (not SETTINGS.disable_inference) and bool(SETTINGS.motion_line_count)
-        use_async_inference = (
+        use_yolo_simple = (
             (not SETTINGS.disable_inference)
             and (not use_motion_line_count)
-            and bool(SETTINGS.async_inference)
-            and (runtime.inference_thread is not None)
+            and (model is not None)
         )
         inference_interval = 1.0 / max(0.1, float(SETTINGS.inference_fps))
+        last_yolo_inference_at = 0.0
 
         try:
             while not runtime.stop_event.is_set():
@@ -1864,29 +2015,30 @@ class TrafficRoundManager:
                         roi_y2,
                     )
 
-                if use_async_inference:
-                    should_enqueue = False
-                    with runtime.inference_lock:
-                        if (
-                            (not runtime.inference_busy)
-                            and (
-                                runtime.last_inference_at is None
-                                or (now - runtime.last_inference_at) >= inference_interval
+                if use_yolo_simple:
+                    if (now - last_yolo_inference_at) >= inference_interval:
+                        last_yolo_inference_at = now
+                        if should_log_tick:
+                            print(
+                                "[traffic-vision-worker] yolo simple inference",
+                                {
+                                    "roundId": runtime.spec.round_id,
+                                    "frame": processed_frame_idx,
+                                },
                             )
-                        ):
-                            runtime.latest_inference_frame = processed_frame.copy()
-                            runtime.latest_inference_frame_idx = int(processed_frame_idx)
-                            runtime.last_inference_at = now
-                            should_enqueue = True
-                    if should_enqueue and should_log_tick:
-                        print(
-                            "[traffic-vision-worker] async inference frame queued",
-                            {"roundId": runtime.spec.round_id, "frame": processed_frame_idx},
+                        self._run_yolo_simple_count(
+                            runtime,
+                            model,
+                            processed_frame,
+                            processed_frame_idx,
+                            line_x1,
+                            line_y1,
+                            line_x2,
+                            line_y2,
                         )
-                else:
+                elif not use_motion_line_count:
                     with runtime.lock:
-                        if not use_motion_line_count:
-                            runtime.detections_last_frame = 0
+                        runtime.detections_last_frame = 0
                 with runtime.lock:
                     if use_motion_line_count:
                         debug_detections_for_frame = list(runtime.latest_motion_debug_detections)
