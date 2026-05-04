@@ -955,31 +955,6 @@ class TrafficRoundManager:
         else:
             cv2.line(annotated, (x1, y1), (x2, y2), (0, 220, 255), 2)
 
-        for det in detections:
-            bbox = det.get("bbox")
-            if not isinstance(bbox, tuple) or len(bbox) != 4:
-                continue
-
-            x_min, y_min, x_max, y_max = bbox
-            side = int(det.get("side", 0))
-            in_roi = bool(det.get("in_roi", True))
-            counted = bool(det.get("counted", False))
-            cooldown = bool(det.get("cooldown", False))
-
-            color = (40, 190, 255)
-            if counted:
-                color = (40, 220, 80)
-            elif cooldown:
-                color = (0, 170, 255)
-            elif side > 0:
-                color = (40, 220, 80)
-            elif side < 0:
-                color = (80, 160, 255)
-            if not in_roi:
-                color = (120, 120, 120)
-
-            cv2.rectangle(annotated, (int(x_min), int(y_min)), (int(x_max), int(y_max)), color, 2)
-
         with runtime.lock:
             current_count = int(runtime.current_count)
 
