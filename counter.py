@@ -1343,7 +1343,7 @@ class TrafficRoundManager:
                     "bbox": [int(x), int(y), int(w), int(h)],
                 },
             )
-            bucket_key = str(int(center_x // 60))
+            bucket_key = str(int(center_x // 30))
             counted = False
             with runtime.lock:
                 last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
@@ -1799,8 +1799,6 @@ class TrafficRoundManager:
                     raw_frame_bytes = encoded_raw.tobytes()
                 with runtime.lock:
                     runtime.last_frame_at = now
-                    if raw_frame_bytes is not None:
-                        runtime.last_debug_frame_jpeg = raw_frame_bytes
                 if raw_frame_bytes is not None and frame_idx <= 3:
                     print(
                         "[traffic-vision-worker] raw live frame stored",
