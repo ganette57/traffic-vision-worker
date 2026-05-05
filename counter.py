@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
+import shutil
+import subprocess
 import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 from config import SETTINGS
@@ -286,6 +289,166 @@ def _resolve_remote_profile(camera_id: Optional[str], stream_url: str, round_id:
 
 def _is_supported_production_camera(camera_id: str) -> bool:
     return str(camera_id or "").strip().lower() in SUPPORTED_PRODUCTION_CAMERA_IDS
+
+
+@dataclass
+class FFmpegFrameReader:
+    source_url: str
+    max_width: int
+    process: Optional[subprocess.Popen] = None
+    frame_width: int = 0
+    frame_height: int = 0
+    frame_size_bytes: int = 0
+
+    def _probe_source_size(self) -> Tuple[int, int]:
+        if not shutil.which("ffprobe"):
+            raise RuntimeError("ffprobe not found on PATH")
+        probe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            self.source_url,
+        ]
+        completed = subprocess.run(
+            probe_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if completed.returncode != 0:
+            stderr_text = (completed.stderr or "").strip()
+            raise RuntimeError(stderr_text or "ffprobe failed to read source stream")
+        size_token = ""
+        for line in (completed.stdout or "").splitlines():
+            line = line.strip()
+            if line:
+                size_token = line
+                break
+        if "x" not in size_token:
+            raise RuntimeError("ffprobe did not return a video size")
+        width_token, height_token = size_token.lower().split("x", 1)
+        width = int(width_token)
+        height = int(height_token)
+        if width <= 0 or height <= 0:
+            raise RuntimeError("invalid source video size from ffprobe")
+        return width, height
+
+    def _read_process_error(self) -> str:
+        if self.process is None or self.process.stderr is None:
+            return ""
+        try:
+            data = self.process.stderr.read()
+        except Exception:
+            return ""
+        if not data:
+            return ""
+        return data.decode("utf-8", errors="ignore").strip()
+
+    def open(self) -> None:
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("ffmpeg not found on PATH")
+        source_width, source_height = self._probe_source_size()
+        target_width = max(64, int(self.max_width))
+        output_width = int(target_width)
+        output_height = max(1, int(round((float(source_height) * float(output_width)) / float(source_width))))
+        self.frame_width = int(output_width)
+        self.frame_height = int(output_height)
+        self.frame_size_bytes = int(self.frame_width * self.frame_height * 3)
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            "-i",
+            self.source_url,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            f"scale={self.frame_width}:{self.frame_height}",
+            "-pix_fmt",
+            "bgr24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+        self.process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=max(10**6, self.frame_size_bytes * 2),
+        )
+        time.sleep(0.15)
+        if self.process.poll() is not None:
+            error_text = self._read_process_error() or "ffmpeg exited before streaming frames"
+            self.close()
+            raise RuntimeError(error_text)
+
+    def _read_exact(self, size: int) -> Optional[bytes]:
+        if self.process is None or self.process.stdout is None:
+            return None
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.process.stdout.read(size - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) != size:
+            return None
+        return bytes(data)
+
+    def read_frame(self) -> Optional[object]:
+        if self.frame_size_bytes <= 0 or self.frame_width <= 0 or self.frame_height <= 0:
+            return None
+        raw_bytes = self._read_exact(self.frame_size_bytes)
+        if raw_bytes is None:
+            return None
+        frame = np.frombuffer(raw_bytes, dtype=np.uint8)
+        expected = self.frame_width * self.frame_height * 3
+        if frame.size != expected:
+            return None
+        return frame.reshape((self.frame_height, self.frame_width, 3))
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        try:
+            if self.process.stdout is not None:
+                self.process.stdout.close()
+        except Exception:
+            pass
+        try:
+            if self.process.stderr is not None:
+                self.process.stderr.close()
+        except Exception:
+            pass
+        if self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=1.0)
+                except Exception:
+                    pass
+        self.process = None
 
 
 @dataclass
@@ -1631,6 +1794,9 @@ class TrafficRoundManager:
                     source_candidates.append(debug_source)
 
         cap: Optional[cv2.VideoCapture] = None
+        ffmpeg_reader: Optional[FFmpegFrameReader] = None
+        use_ffmpeg_reader = False
+        ffmpeg_fallback_attempted = False
         active_source: Optional[str] = None
         for source in source_candidates:
             candidate = str(source).strip()
@@ -1647,13 +1813,42 @@ class TrafficRoundManager:
                 },
             )
 
-            trial = cv2.VideoCapture(candidate)
-            if trial.isOpened():
-                cap = trial
-                active_source = candidate
-                break
+            if source_type == "remote_stream":
+                try:
+                    reader = FFmpegFrameReader(candidate, int(SETTINGS.max_process_width))
+                    reader.open()
+                    ffmpeg_reader = reader
+                    active_source = candidate
+                    use_ffmpeg_reader = True
+                    print(
+                        "[traffic-vision-worker] ffmpeg stream opened",
+                        {"roundId": runtime.spec.round_id, "source": candidate},
+                    )
+                    break
+                except Exception as ffmpeg_error:
+                    print(
+                        "[traffic-vision-worker] ffmpeg stream open failed, falling back to cv2.VideoCapture",
+                        {
+                            "roundId": runtime.spec.round_id,
+                            "source": candidate,
+                            "error": str(ffmpeg_error),
+                        },
+                    )
+                    trial = cv2.VideoCapture(candidate)
+                    if trial.isOpened():
+                        cap = trial
+                        active_source = candidate
+                        use_ffmpeg_reader = False
+                        break
+                    trial.release()
+            else:
+                trial = cv2.VideoCapture(candidate)
+                if trial.isOpened():
+                    cap = trial
+                    active_source = candidate
+                    break
+                trial.release()
 
-            trial.release()
             print(
                 "[traffic-vision-worker] source opened failed",
                 {
@@ -1662,7 +1857,7 @@ class TrafficRoundManager:
                 },
             )
 
-        if cap is None or active_source is None:
+        if (ffmpeg_reader is None and cap is None) or active_source is None:
             with runtime.lock:
                 runtime.status = "stopped"
                 runtime.stop_reason = "stream_open_failed"
@@ -1773,9 +1968,60 @@ class TrafficRoundManager:
                     )
                     break
 
-                ok, frame = cap.read()
+                if use_ffmpeg_reader and ffmpeg_reader is not None:
+                    frame = ffmpeg_reader.read_frame()
+                    ok = frame is not None
+                    if ok and (
+                        frame_idx <= 3
+                        or (
+                            SETTINGS.frame_log_interval > 0
+                            and frame_idx % SETTINGS.frame_log_interval == 0
+                        )
+                    ):
+                        print(
+                            "[traffic-vision-worker] ffmpeg frame read success",
+                            {"roundId": runtime.spec.round_id, "frame": int(frame_idx + 1)},
+                        )
+                else:
+                    if cap is None:
+                        ok = False
+                        frame = None
+                    else:
+                        ok, frame = cap.read()
                 if not ok or frame is None:
                     frame_read_failures += 1
+                    if use_ffmpeg_reader:
+                        print(
+                            "[traffic-vision-worker] ffmpeg frame read failed",
+                            {
+                                "roundId": runtime.spec.round_id,
+                                "failures": frame_read_failures,
+                            },
+                        )
+                        if not ffmpeg_fallback_attempted and active_source:
+                            ffmpeg_fallback_attempted = True
+                            print(
+                                "[traffic-vision-worker] ffmpeg pipe failed, attempting cv2.VideoCapture fallback",
+                                {"roundId": runtime.spec.round_id, "source": active_source},
+                            )
+                            fallback = cv2.VideoCapture(active_source)
+                            if fallback.isOpened():
+                                cap = fallback
+                                use_ffmpeg_reader = False
+                                if ffmpeg_reader is not None:
+                                    ffmpeg_reader.close()
+                                    ffmpeg_reader = None
+                                frame_read_failures = 0
+                                print(
+                                    "[traffic-vision-worker] ffmpeg fallback to cv2.VideoCapture enabled",
+                                    {"roundId": runtime.spec.round_id, "source": active_source},
+                                )
+                                continue
+                            fallback.release()
+                            print(
+                                "[traffic-vision-worker] ffmpeg fallback to cv2.VideoCapture failed",
+                                {"roundId": runtime.spec.round_id, "source": active_source},
+                            )
                     if frame_read_failures <= 3 or (
                         SETTINGS.frame_log_interval > 0
                         and frame_read_failures % SETTINGS.frame_log_interval == 0
@@ -2083,7 +2329,10 @@ class TrafficRoundManager:
             runtime.inference_stop_event.set()
             if runtime.inference_thread and runtime.inference_thread.is_alive():
                 runtime.inference_thread.join(timeout=0.5)
-            cap.release()
+            if ffmpeg_reader is not None:
+                ffmpeg_reader.close()
+            if cap is not None:
+                cap.release()
             with runtime.lock:
                 if runtime.status == "running":
                     runtime.status = "stopped" if runtime.stop_event.is_set() else "ended"
