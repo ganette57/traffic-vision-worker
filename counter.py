@@ -506,6 +506,7 @@ class RoundRuntime:
     latest_async_debug_detections: List[Dict[str, object]] = field(default_factory=list)
     previous_gray_frame: Optional[object] = None
     motion_counted_buckets_last_frame: Dict[str, int] = field(default_factory=dict)
+    motion_last_count_frame: Optional[int] = None
     latest_motion_debug_detections: List[Dict[str, object]] = field(default_factory=list)
     inference_thread: Optional[threading.Thread] = None
     inference_stop_event: threading.Event = field(default_factory=threading.Event)
@@ -1135,7 +1136,7 @@ class TrafficRoundManager:
             cv2.LINE_AA,
         )
 
-        ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         if not ok:
             return
 
@@ -1390,6 +1391,12 @@ class TrafficRoundManager:
         max_reject_logs = 3
         debug_detections: List[Dict[str, object]] = []
         line_margin_px = float(SETTINGS.motion_line_margin_px)
+        frame_counted = False
+
+        resolved_camera_id = _normalize_camera_id(runtime.spec.camera_id)
+        if not resolved_camera_id:
+            resolved_camera_id = _camera_id_from_stream(runtime.source_url or runtime.spec.stream_url)
+        is_cam2 = resolved_camera_id == "cam2"
 
         with runtime.lock:
             expired = [
@@ -1459,11 +1466,22 @@ class TrafficRoundManager:
             if aspect < min_aspect or aspect > max_aspect:
                 reject_blob("aspect_out_of_range", x, y, w, h, area, center_x, center_y)
                 continue
+            if is_cam2:
+                fill_ratio = float(area) / float(max(1, w * h))
+                if fill_ratio < 0.18:
+                    reject_blob("cam2_fill_ratio_low", x, y, w, h, area, center_x, center_y)
+                    continue
 
             touches_line_zone = (int(y) <= int(line_y + line_margin_px)) and (
                 int(y + h) >= int(line_y - line_margin_px)
             )
             if not touches_line_zone:
+                reject_blob("line_band_no_overlap", x, y, w, h, area, center_x, center_y)
+                continue
+
+            center_line_distance = abs(float(center_y) - float(line_y))
+            if center_line_distance > float(line_margin_px):
+                reject_blob("center_too_far_from_line", x, y, w, h, area, center_x, center_y)
                 continue
 
             in_roi = True
@@ -1495,30 +1513,47 @@ class TrafficRoundManager:
                     "bbox": [int(x), int(y), int(w), int(h)],
                 },
             )
+
             bucket_key = str(int(center_x // 30))
             counted = False
+            cooldown_rejected = False
             with runtime.lock:
-                last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
-                if last_seen is None or (int(frame_idx) - int(last_seen)) >= cooldown:
-                    runtime.motion_counted_buckets_last_frame[bucket_key] = int(frame_idx)
-                    runtime.current_count += 1
-                    runtime.last_counted_track_id = int(center_x)
-                    runtime.last_crossing_direction = "motion_line_touch"
-                    runtime.last_reject_reason = None
-                    current_count = int(runtime.current_count)
-                    counted = True
-                    print(
-                        "[Traffic][COUNT_PLUS_ONE]",
-                        {
-                            "roundId": runtime.spec.round_id,
-                            "frame": int(frame_idx),
-                            "centerX": int(center_x),
-                            "bucket": bucket_key,
-                            "currentCount": current_count,
-                        },
+                global_last = runtime.motion_last_count_frame
+                global_cooldown_active = (
+                    global_last is not None and (int(frame_idx) - int(global_last)) < cooldown
+                )
+                if frame_counted or global_cooldown_active:
+                    cooldown_rejected = True
+                else:
+                    last_seen = runtime.motion_counted_buckets_last_frame.get(bucket_key)
+                    bucket_cooldown_active = (
+                        last_seen is not None and (int(frame_idx) - int(last_seen)) < cooldown
                     )
+                    if bucket_cooldown_active:
+                        cooldown_rejected = True
+                    else:
+                        runtime.motion_counted_buckets_last_frame[bucket_key] = int(frame_idx)
+                        runtime.motion_last_count_frame = int(frame_idx)
+                        runtime.current_count += 1
+                        runtime.last_counted_track_id = int(center_x)
+                        runtime.last_crossing_direction = "motion_line_touch"
+                        runtime.last_reject_reason = None
+                        current_count = int(runtime.current_count)
+                        counted = True
+                        print(
+                            "[Traffic][COUNT_PLUS_ONE]",
+                            {
+                                "roundId": runtime.spec.round_id,
+                                "frame": int(frame_idx),
+                                "bbox": [int(x), int(y), int(w), int(h)],
+                                "center": [int(center_x), int(center_y)],
+                                "cooldownFrames": int(cooldown),
+                                "currentCount": current_count,
+                            },
+                        )
 
             if counted:
+                frame_counted = True
                 accepted += 1
                 debug_detections.append(
                     {
@@ -1533,21 +1568,23 @@ class TrafficRoundManager:
                         "cooldown": False,
                     }
                 )
-            else:
-                debug_detections.append(
-                    {
-                        "track_id": int(center_x),
-                        "class_id": 2,
-                        "bbox": (float(x), float(y), float(x + w), float(y + h)),
-                        "point_x": int(center_x),
-                        "point_y": int(center_y),
-                        "side": int(side),
-                        "in_roi": bool(in_roi),
-                        "counted": False,
-                        "cooldown": True,
-                    }
-                )
+                continue
+
+            if cooldown_rejected:
                 reject_blob("cooldown_active", x, y, w, h, area, center_x, center_y)
+            debug_detections.append(
+                {
+                    "track_id": int(center_x),
+                    "class_id": 2,
+                    "bbox": (float(x), float(y), float(x + w), float(y + h)),
+                    "point_x": int(center_x),
+                    "point_y": int(center_y),
+                    "side": int(side),
+                    "in_roi": bool(in_roi),
+                    "counted": False,
+                    "cooldown": bool(cooldown_rejected),
+                }
+            )
 
         print(
             "[Traffic][MOTION_BLOBS]",
@@ -1946,6 +1983,18 @@ class TrafficRoundManager:
         )
         inference_interval = 1.0 / max(0.1, float(SETTINGS.inference_fps))
         last_yolo_inference_at = 0.0
+        if use_motion_line_count:
+            print(
+                "[traffic-vision-worker] motion mode settings",
+                {
+                    "roundId": runtime.spec.round_id,
+                    "cooldownFrames": int(SETTINGS.motion_cooldown_frames),
+                    "processFps": float(SETTINGS.process_fps),
+                    "maxProcessWidth": int(SETTINGS.max_process_width),
+                    "minArea": float(SETTINGS.motion_min_area),
+                    "lineMargin": float(SETTINGS.motion_line_margin_px),
+                },
+            )
 
         try:
             while not runtime.stop_event.is_set():
@@ -2028,7 +2077,7 @@ class TrafficRoundManager:
                 frame_idx += 1
                 raw_frame_bytes: Optional[bytes] = None
                 ok_raw, encoded_raw = cv2.imencode(
-                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
                 )
                 if ok_raw:
                     raw_frame_bytes = encoded_raw.tobytes()
