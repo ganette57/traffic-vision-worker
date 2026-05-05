@@ -106,14 +106,14 @@ CAMERA_REMOTE_STREAM_PROFILES: Dict[str, Dict[str, object]] = {
         "line_margin_px": 20.0,
     },
     "cam2": {
-        "line_x1_ratio": 0.50,
-        "line_y1_ratio": 0.20,
-        "line_x2_ratio": 0.50,
-        "line_y2_ratio": 0.90,
-        "roi_x_min_ratio": 0.30,
-        "roi_x_max_ratio": 0.70,
-        "roi_y_min_ratio": 0.15,
-        "roi_y_max_ratio": 0.95,
+        "line_x1_ratio": 0.46,
+        "line_y1_ratio": 0.60,
+        "line_x2_ratio": 0.74,
+        "line_y2_ratio": 0.60,
+        "roi_x_min_ratio": 0.00,
+        "roi_x_max_ratio": 1.00,
+        "roi_y_min_ratio": 0.20,
+        "roi_y_max_ratio": 1.00,
         "min_samples": 2,
         "min_motion_px": 5.0,
         "min_bbox_area_px": 250.0,
@@ -570,7 +570,7 @@ class TrafficRoundManager:
 
     def _get_model(self) -> Optional[YOLO]:
         with self._model_lock:
-            if SETTINGS.disable_inference:
+            if SETTINGS.disable_inference or SETTINGS.motion_line_count:
                 return None
             if self._model is None:
                 self._model = YOLO(SETTINGS.model_name)
@@ -1103,20 +1103,9 @@ class TrafficRoundManager:
         y1 = int(float(line_y1))
         x2 = int(float(line_x2))
         y2 = int(float(line_y2))
-        with runtime.lock:
-            horizontal_vertical_mode = (
-                runtime.counting_line_y is not None and runtime.counting_line_x is None
-            )
 
-        if horizontal_vertical_mode:
-            # Subtle glow for horizontal counting lines (cam1/cam2).
-            overlay = annotated.copy()
-            cv2.line(overlay, (x1, y1), (x2, y2), (40, 180, 70), 8)
-            cv2.line(overlay, (x1, y1), (x2, y2), (60, 210, 95), 4)
-            cv2.addWeighted(overlay, 0.22, annotated, 0.78, 0.0, annotated)
-            cv2.line(annotated, (x1, y1), (x2, y2), (70, 235, 120), 2)
-        else:
-            cv2.line(annotated, (x1, y1), (x2, y2), (0, 220, 255), 2)
+        # Keep the counting line always visible with a strong green stroke.
+        cv2.line(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
         with runtime.lock:
             current_count = int(runtime.current_count)
@@ -1146,7 +1135,7 @@ class TrafficRoundManager:
             cv2.LINE_AA,
         )
 
-        ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if not ok:
             return
 
@@ -1903,14 +1892,14 @@ class TrafficRoundManager:
                 "source": active_source,
             },
         )
-        if SETTINGS.disable_inference:
-            print(
-                "[traffic-vision-worker] inference disabled (live-only mode)",
-                {"roundId": runtime.spec.round_id},
-            )
-        elif SETTINGS.motion_line_count:
+        if SETTINGS.motion_line_count:
             print(
                 "[traffic-vision-worker] motion line count enabled (opencv-only mode)",
+                {"roundId": runtime.spec.round_id},
+            )
+        elif SETTINGS.disable_inference:
+            print(
+                "[traffic-vision-worker] inference disabled (live-only mode)",
                 {"roundId": runtime.spec.round_id},
             )
         else:
@@ -1949,7 +1938,7 @@ class TrafficRoundManager:
         roi_x2: Optional[int] = None
         roi_y2: Optional[int] = None
         line_metrics_logged = False
-        use_motion_line_count = (not SETTINGS.disable_inference) and bool(SETTINGS.motion_line_count)
+        use_motion_line_count = bool(SETTINGS.motion_line_count)
         use_yolo_simple = (
             (not SETTINGS.disable_inference)
             and (not use_motion_line_count)
