@@ -106,8 +106,8 @@ CAMERA_REMOTE_STREAM_PROFILES: Dict[str, Dict[str, object]] = {
         "line_margin_px": 20.0,
     },
     "cam2": {
-        "line_x1_ratio": 0.45,
-        "line_y1_ratio": 0.70,
+        "line_x1_ratio": 0.36,
+        "line_y1_ratio": 0.78,
         "line_x2_ratio": 0.72,
         "line_y2_ratio": 0.46,
         "roi_x_min_ratio": 0.00,
