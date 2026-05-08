@@ -1479,11 +1479,6 @@ class TrafficRoundManager:
                 reject_blob("line_band_no_overlap", x, y, w, h, area, center_x, center_y)
                 continue
 
-            center_line_distance = abs(float(center_y) - float(line_y))
-            if center_line_distance > float(line_margin_px):
-                reject_blob("center_too_far_from_line", x, y, w, h, area, center_x, center_y)
-                continue
-
             in_roi = True
             if roi_x1 is not None and center_x < float(roi_x1):
                 reject_blob("center_x_left_of_roi", x, y, w, h, area, center_x, center_y)
